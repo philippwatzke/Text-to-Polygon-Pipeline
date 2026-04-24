@@ -924,7 +924,12 @@ def get_nodata_for_job(db_path: Path, job_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 def validate_bulk(db_path: Path, job_id: str, updates: list[dict]) -> int:
-    """executemany-based bulk update per Spec §8. Increments validation_revision."""
+    """executemany-based bulk update per Spec §8. Increments validation_revision.
+
+    Note: we rely on sqlite3.Cursor.rowcount being cumulative across an
+    executemany() call — this is only guaranteed on Python 3.12+. The
+    pyproject.toml requires-python setting enforces that; do NOT downgrade.
+    """
     if not updates:
         return 0
     with connect(db_path) as conn:
@@ -1004,6 +1009,8 @@ git commit -m "feat(jobs): polygon/nodata persistence, bulk validate, claim, sta
 - Test: `tests/pipeline/test_wcs_client.py`
 
 **See Spec §5.1 pts 1, 4, 5, 6** — snapping, margin expansion, minimum size, pixel-count via round().
+
+> ⚠ **Spec-internal inconsistency** (verify before merging): Spec §5.1 pt 4 quotes the margin-expansion as "64 m / 128 m / 192 m" for small/medium/large — but those numbers are `2·CENTER_MARGIN·0.2 m` (= the Max-Object-Size from §5.2 table), not `CENTER_MARGIN·0.2 m` (= 32 m / 64 m / 96 m). This plan follows the **§5.2 formula** (`CENTER_MARGIN_PX[preset] * 0.2`) because it is consistent with the Safe-Center geometry and the Center-Keep rule. If the spec author actually intended the larger expansion, change `CENTER_MARGIN_PX` to `{SMALL: 320, MEDIUM: 640, LARGE: 960}` and update the tests in Step 1 accordingly.
 
 Split of concerns: this task implements only the pure geometry math; HTTP comes next task.
 
@@ -2131,3 +2138,2867 @@ git commit -m "feat(merger): raster→polygon with connectivity=8, polygon-only,
 ```
 
 ---
+
+## Task 15: Exporter — Two-Layer GPKG with AOI Clip + Empty-Schema Handling
+
+**Files:**
+- Create: `ki_geodaten/pipeline/exporter.py`
+- Test: `tests/pipeline/test_exporter.py`
+
+**See Spec §5.5** — AOI clip (Clip-Window-Semantik), re-export overwrite, empty layers with explicit schema AND explicit CRS, `nodata_regions` carries safe-center footprints (caller responsibility).
+
+- [ ] **Step 1: Write failing test**
+
+```python
+# tests/pipeline/test_exporter.py
+import geopandas as gpd
+import pytest
+from pathlib import Path
+from shapely.geometry import Polygon, box
+import fiona
+
+from ki_geodaten.pipeline.exporter import export_two_layer_gpkg
+
+def _aoi():
+    return box(691000.0, 5335000.0, 692000.0, 5336000.0)
+
+def _detected_gdf(geoms, scores=None):
+    scores = scores or [0.9] * len(geoms)
+    return gpd.GeoDataFrame(
+        {"score": scores,
+         "source_tile_row": [0] * len(geoms),
+         "source_tile_col": [0] * len(geoms)},
+        geometry=list(geoms), crs="EPSG:25832",
+    )
+
+def _nodata_gdf(geoms, reasons=None):
+    reasons = reasons or ["NODATA_PIXELS"] * len(geoms)
+    return gpd.GeoDataFrame(
+        {"reason": reasons}, geometry=list(geoms), crs="EPSG:25832",
+    )
+
+def test_export_writes_two_layers(tmp_path: Path):
+    out = tmp_path / "j.gpkg"
+    inside = Polygon([(691100, 5335100), (691200, 5335100),
+                      (691200, 5335200), (691100, 5335200)])
+    export_two_layer_gpkg(
+        detected_gdf=_detected_gdf([inside]),
+        nodata_gdf=_nodata_gdf([]),
+        requested_bbox=_aoi(),
+        out_path=out,
+    )
+    assert out.exists()
+    layers = fiona.listlayers(str(out))
+    assert "detected_objects" in layers
+    assert "nodata_regions" in layers
+
+def test_export_clips_crossing_polygon_to_aoi(tmp_path: Path):
+    out = tmp_path / "j.gpkg"
+    # Polygon crosses east edge of AOI (maxx=692000)
+    crossing = Polygon([(691900, 5335500), (692100, 5335500),
+                        (692100, 5335600), (691900, 5335600)])
+    export_two_layer_gpkg(
+        detected_gdf=_detected_gdf([crossing]),
+        nodata_gdf=_nodata_gdf([]),
+        requested_bbox=_aoi(),
+        out_path=out,
+    )
+    gdf = gpd.read_file(out, layer="detected_objects")
+    assert len(gdf) == 1
+    xs = [pt[0] for pt in gdf.geometry.iloc[0].exterior.coords]
+    assert max(xs) <= 692000.0 + 1e-6
+
+def test_export_drops_polygon_fully_outside_aoi(tmp_path: Path):
+    out = tmp_path / "j.gpkg"
+    far = Polygon([(700000, 5400000), (700100, 5400000),
+                   (700100, 5400100), (700000, 5400100)])
+    export_two_layer_gpkg(
+        detected_gdf=_detected_gdf([far]),
+        nodata_gdf=_nodata_gdf([]),
+        requested_bbox=_aoi(),
+        out_path=out,
+    )
+    gdf = gpd.read_file(out, layer="detected_objects")
+    assert len(gdf) == 0
+    assert str(gdf.crs) == "EPSG:25832"
+
+def test_export_empty_detected_has_explicit_crs(tmp_path: Path):
+    out = tmp_path / "j.gpkg"
+    export_two_layer_gpkg(
+        detected_gdf=_detected_gdf([]),
+        nodata_gdf=_nodata_gdf([]),
+        requested_bbox=_aoi(),
+        out_path=out,
+    )
+    gdf = gpd.read_file(out, layer="detected_objects")
+    assert len(gdf) == 0
+    assert str(gdf.crs) == "EPSG:25832"
+    # schema properties exist
+    with fiona.open(str(out), layer="detected_objects") as src:
+        props = src.schema["properties"]
+        assert "score" in props
+        assert "source_tile_row" in props
+        assert "source_tile_col" in props
+
+def test_export_overwrites_existing_file(tmp_path: Path):
+    out = tmp_path / "j.gpkg"
+    p1 = Polygon([(691100, 5335100), (691200, 5335100),
+                  (691200, 5335200), (691100, 5335200)])
+    p2 = Polygon([(691300, 5335300), (691400, 5335300),
+                  (691400, 5335400), (691300, 5335400)])
+    export_two_layer_gpkg(_detected_gdf([p1]), _nodata_gdf([]), _aoi(), out)
+    export_two_layer_gpkg(_detected_gdf([p2]), _nodata_gdf([]), _aoi(), out)
+    gdf = gpd.read_file(out, layer="detected_objects")
+    assert len(gdf) == 1   # only p2, not p1 + p2
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/pipeline/test_exporter.py -v`
+Expected: FAIL (ModuleNotFoundError).
+
+- [ ] **Step 3: Implement**
+
+```python
+# ki_geodaten/pipeline/exporter.py
+from __future__ import annotations
+from pathlib import Path
+from typing import Iterable
+
+import geopandas as gpd
+import pandas as pd
+from shapely.geometry.base import BaseGeometry
+from shapely.validation import make_valid
+
+from ki_geodaten.pipeline.merger import extract_polygons
+
+_DETECTED_LAYER = "detected_objects"
+_NODATA_LAYER = "nodata_regions"
+_CRS = "EPSG:25832"
+
+_EMPTY_DETECTED_COLS = ("score", "source_tile_row", "source_tile_col")
+_EMPTY_NODATA_COLS = ("reason",)
+
+def _clip_and_normalize(
+    gdf: gpd.GeoDataFrame, aoi: BaseGeometry,
+) -> gpd.GeoDataFrame:
+    """Spec §5.5: Clip-Window-Semantik. After intersection, geometries may
+    become MultiPolygon/GeometryCollection — re-run polygon-only pipeline."""
+    if len(gdf) == 0:
+        return gdf
+    clipped = gdf.copy()
+    clipped["geometry"] = clipped.geometry.intersection(aoi)
+    clipped = clipped[~clipped.geometry.is_empty]
+    # Explode to polygon-only components
+    rows: list[dict] = []
+    geoms: list = []
+    for _, rec in clipped.iterrows():
+        geom = make_valid(rec.geometry)
+        for poly in extract_polygons(geom):
+            payload = {k: rec[k] for k in rec.index if k != "geometry"}
+            rows.append(payload)
+            geoms.append(poly)
+    if not geoms:
+        return gpd.GeoDataFrame(
+            {c: [] for c in gdf.columns if c != "geometry"},
+            geometry=[], crs=_CRS,
+        )
+    return gpd.GeoDataFrame(rows, geometry=geoms, crs=_CRS)
+
+def _empty_with_schema(cols: Iterable[str]) -> gpd.GeoDataFrame:
+    """Spec §5.5 final — empty layer must still carry CRS and property columns."""
+    return gpd.GeoDataFrame(
+        {c: [] for c in cols}, geometry=[], crs=_CRS,
+    )
+
+def export_two_layer_gpkg(
+    detected_gdf: gpd.GeoDataFrame,
+    nodata_gdf: gpd.GeoDataFrame,
+    requested_bbox: BaseGeometry,
+    out_path: Path,
+) -> None:
+    """Spec §5.5 signature. Overwrites out_path unconditionally."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.unlink(missing_ok=True)
+
+    det = _clip_and_normalize(detected_gdf, requested_bbox)
+    nod = _clip_and_normalize(nodata_gdf, requested_bbox)
+
+    if len(det) == 0:
+        det = _empty_with_schema(_EMPTY_DETECTED_COLS)
+    if len(nod) == 0:
+        nod = _empty_with_schema(_EMPTY_NODATA_COLS)
+
+    det.to_file(out_path, layer=_DETECTED_LAYER, driver="GPKG")
+    nod.to_file(out_path, layer=_NODATA_LAYER, driver="GPKG")
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/pipeline/test_exporter.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/pipeline/exporter.py tests/pipeline/test_exporter.py
+git commit -m "feat(exporter): two-layer GPKG with AOI clip, overwrite, and empty-schema"
+```
+
+---
+
+## Task 16: Serialization — WKB → GeoJSON (AOI-Clipped, Transformed, Precision-Reduced)
+
+**Files:**
+- Create: `ki_geodaten/app/serialization.py`
+- Test: `tests/app/test_serialization.py`
+
+**See Spec §8** — transform EPSG:25832 → EPSG:4326, `shapely.set_precision(grid_size=1e-6)`, AOI clip uses `bbox_utm_snapped` in UTM **before** transform.
+
+This module is intended to run inside a `ProcessPoolExecutor` (Task 20). No HTTP state here; only pure serialization.
+
+- [ ] **Step 1: Write failing test**
+
+```python
+# tests/app/test_serialization.py
+import json
+import pytest
+from shapely.geometry import Polygon, box
+from shapely.wkb import dumps as wkb_dumps
+
+from ki_geodaten.app.serialization import (
+    build_polygons_feature_collection,
+    build_nodata_feature_collection,
+)
+
+def _aoi_utm():
+    return (691000.0, 5335000.0, 692000.0, 5336000.0)
+
+def _poly_wkb(geom):
+    return wkb_dumps(geom)
+
+def test_polygons_geojson_has_4326_bounds_inside_bayern():
+    poly = Polygon([(691100, 5335100), (691200, 5335100),
+                    (691200, 5335200), (691100, 5335200)])
+    rows = [{"id": 1, "geometry_wkb": _poly_wkb(poly),
+             "score": 0.88, "validation": "ACCEPTED"}]
+    fc = build_polygons_feature_collection(rows, aoi_utm=_aoi_utm())
+    feat = fc["features"][0]
+    assert feat["geometry"]["type"] == "Polygon"
+    xs = [c[0] for c in feat["geometry"]["coordinates"][0]]
+    assert 8.9 <= min(xs) <= max(xs) <= 13.9
+    assert feat["properties"] == {"id": 1, "score": 0.88, "validation": "ACCEPTED"}
+
+def test_polygons_precision_capped_at_1e_6():
+    poly = Polygon([(691123.456789, 5335111.222333),
+                    (691200, 5335100), (691200, 5335200),
+                    (691100, 5335200)])
+    rows = [{"id": 1, "geometry_wkb": _poly_wkb(poly),
+             "score": 0.5, "validation": "ACCEPTED"}]
+    fc = build_polygons_feature_collection(rows, aoi_utm=_aoi_utm())
+    for coord in fc["features"][0]["geometry"]["coordinates"][0]:
+        for v in coord:
+            frac = abs(v - round(v, 6))
+            assert frac < 1e-9, f"coord {v} exceeds 6 decimal precision"
+
+def test_polygons_clip_by_aoi():
+    poly = Polygon([(691900, 5335500), (692200, 5335500),
+                    (692200, 5335600), (691900, 5335600)])
+    rows = [{"id": 1, "geometry_wkb": _poly_wkb(poly),
+             "score": 0.8, "validation": "ACCEPTED"}]
+    fc = build_polygons_feature_collection(rows, aoi_utm=_aoi_utm())
+    # Should still yield a feature (polygon intersects AOI)
+    assert len(fc["features"]) == 1
+
+def test_polygons_drop_fully_outside():
+    poly = Polygon([(700000, 5400000), (700100, 5400000),
+                    (700100, 5400100), (700000, 5400100)])
+    rows = [{"id": 1, "geometry_wkb": _poly_wkb(poly),
+             "score": 0.8, "validation": "ACCEPTED"}]
+    fc = build_polygons_feature_collection(rows, aoi_utm=_aoi_utm())
+    assert fc["features"] == []
+
+def test_nodata_geojson_carries_reason():
+    poly = Polygon([(691100, 5335100), (691200, 5335100),
+                    (691200, 5335200), (691100, 5335200)])
+    rows = [{"id": 9, "geometry_wkb": _poly_wkb(poly),
+             "reason": "OOM"}]
+    fc = build_nodata_feature_collection(rows, aoi_utm=_aoi_utm())
+    assert fc["features"][0]["properties"] == {"reason": "OOM"}
+
+def test_feature_collection_is_json_serializable():
+    poly = Polygon([(691100, 5335100), (691200, 5335100),
+                    (691200, 5335200), (691100, 5335200)])
+    rows = [{"id": 1, "geometry_wkb": _poly_wkb(poly),
+             "score": 0.5, "validation": "ACCEPTED"}]
+    fc = build_polygons_feature_collection(rows, aoi_utm=_aoi_utm())
+    json.dumps(fc)  # must not raise
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/app/test_serialization.py -v`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement**
+
+```python
+# ki_geodaten/app/serialization.py
+from __future__ import annotations
+from typing import Iterable
+import shapely
+from shapely.geometry import box, mapping
+from shapely.ops import transform as shapely_transform
+from shapely.wkb import loads as wkb_loads
+from shapely.validation import make_valid
+
+from ki_geodaten.pipeline.geo_utils import transformer_25832_to_4326
+from ki_geodaten.pipeline.merger import extract_polygons
+
+_PRECISION_DEG = 1e-6
+
+def _transform_to_4326(geom):
+    t = transformer_25832_to_4326()
+    return shapely_transform(lambda x, y, z=None: t.transform(x, y), geom)
+
+def _clip_transform_precision(geom, aoi_utm_polygon):
+    """Clip in UTM, transform to 4326, set precision."""
+    clipped = geom.intersection(aoi_utm_polygon)
+    if clipped.is_empty:
+        return []
+    clipped = make_valid(clipped)
+    polys = extract_polygons(clipped)
+    out = []
+    for poly in polys:
+        p_4326 = _transform_to_4326(poly)
+        p_4326 = shapely.set_precision(p_4326, grid_size=_PRECISION_DEG)
+        if p_4326.is_empty:
+            continue
+        out.append(p_4326)
+    return out
+
+def _feature_collection(features: list[dict]) -> dict:
+    return {"type": "FeatureCollection", "features": features}
+
+def build_polygons_feature_collection(
+    rows: Iterable[dict], *, aoi_utm: tuple[float, float, float, float],
+) -> dict:
+    """Spec §8: /jobs/{id}/polygons payload. Clipped to aoi_utm, EPSG:4326."""
+    aoi = box(*aoi_utm)
+    features: list[dict] = []
+    for r in rows:
+        geom = wkb_loads(r["geometry_wkb"])
+        for g4326 in _clip_transform_precision(geom, aoi):
+            features.append({
+                "type": "Feature",
+                "geometry": mapping(g4326),
+                "properties": {
+                    "id": r["id"],
+                    "score": r["score"],
+                    "validation": r["validation"],
+                },
+            })
+    return _feature_collection(features)
+
+def build_nodata_feature_collection(
+    rows: Iterable[dict], *, aoi_utm: tuple[float, float, float, float],
+) -> dict:
+    """Spec §8: /jobs/{id}/nodata payload. Clipped to aoi_utm, EPSG:4326."""
+    aoi = box(*aoi_utm)
+    features: list[dict] = []
+    for r in rows:
+        geom = wkb_loads(r["geometry_wkb"])
+        for g4326 in _clip_transform_precision(geom, aoi):
+            features.append({
+                "type": "Feature",
+                "geometry": mapping(g4326),
+                "properties": {"reason": r["reason"]},
+            })
+    return _feature_collection(features)
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/app/test_serialization.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/app/serialization.py tests/app/test_serialization.py
+git commit -m "feat(app): WKB→GeoJSON with AOI clip, 25832→4326 transform, 1e-6 precision"
+```
+
+---
+
+## Task 17: Safe-Center Polygon Helper
+
+**Files:**
+- Modify: `ki_geodaten/pipeline/tiler.py` (append)
+- Test: `tests/pipeline/test_tiler.py` (append)
+
+**See Spec §5.5** — NoData geometry is the **safe-center footprint** (size-2·margin square), NOT the full tile footprint. The orchestrator needs a single helper to derive that polygon from a `Tile` or `NodataTile`.
+
+- [ ] **Step 1: Append failing tests**
+
+```python
+# tests/pipeline/test_tiler.py (append)
+from shapely.geometry import Polygon
+from ki_geodaten.pipeline.tiler import safe_center_polygon
+
+def test_safe_center_polygon_medium():
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+    from affine import Affine
+    # Tile at UTM (691000, 5336204.8) with 0.2 m px, top-left origin
+    affine = Affine(0.2, 0, 691000.0, 0, -0.2, 5336204.8)
+    t = Tile(
+        array=np.zeros((cfg.size, cfg.size, 3), dtype=np.uint8),
+        pixel_origin=(0, 0), size=cfg.size, center_margin=cfg.center_margin,
+        affine=affine, tile_row=0, tile_col=0,
+        nodata_mask=np.zeros((cfg.size, cfg.size), dtype=bool),
+    )
+    poly = safe_center_polygon(t)
+    assert isinstance(poly, Polygon)
+    minx, miny, maxx, maxy = poly.bounds
+    # Margin = 320 px * 0.2 m = 64 m; safe center side = 384 px * 0.2 m = 76.8 m
+    assert maxx - minx == pytest.approx(76.8)
+    assert maxy - miny == pytest.approx(76.8)
+    # Lower-left corner: col=320, row=704 → x = 691000 + 64 = 691064; y = 5336204.8 - 704*0.2 = 5336064
+    assert minx == pytest.approx(691064.0)
+    assert maxy == pytest.approx(5336204.8 - 64.0)
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/pipeline/test_tiler.py -v`
+Expected: new test FAILs.
+
+- [ ] **Step 3: Append implementation**
+
+```python
+# ki_geodaten/pipeline/tiler.py (append)
+from shapely.geometry import Polygon as _ShpPolygon
+
+def safe_center_polygon(tile: "Tile | NodataTile") -> _ShpPolygon:
+    """Spec §5.5: return UTM polygon of the safe-center square (not full tile)."""
+    m = tile.center_margin
+    size = tile.size
+    # Corners in pixel-space (col, row) for the safe-center square:
+    corners_px = [
+        (m, m),
+        (size - m, m),
+        (size - m, size - m),
+        (m, size - m),
+    ]
+    corners_utm = [tile.affine * c for c in corners_px]
+    return _ShpPolygon(corners_utm)
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/pipeline/test_tiler.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/pipeline/tiler.py tests/pipeline/test_tiler.py
+git commit -m "feat(tiler): safe_center_polygon helper for NoData persistence"
+```
+
+---
+
+## Task 18: Worker Orchestrator — Per-Tile Commits & Error Handling
+
+**Files:**
+- Create: `ki_geodaten/worker/orchestrator.py`
+- Test: `tests/worker/test_orchestrator.py`
+
+**See Spec §6, §10** — per-tile try/except (`OOM` / `INFERENCE_ERROR` → `nodata_regions` with safe-center geometry), per-job try/except (status FAILED with stacktrace tail), per-tile commit to avoid long-running write transactions.
+
+- [ ] **Step 1: Write failing test**
+
+```python
+# tests/worker/test_orchestrator.py
+import numpy as np
+import pytest
+from affine import Affine
+from pathlib import Path
+from shapely.geometry import Polygon, box
+from shapely.wkb import dumps as wkb_dumps
+
+from ki_geodaten.jobs.store import (
+    init_schema, insert_job, get_job, get_polygons_for_job, get_nodata_for_job,
+)
+from ki_geodaten.models import JobStatus, TilePreset
+from ki_geodaten.pipeline.segmenter import MaskResult
+from ki_geodaten.pipeline.tiler import Tile, TileConfig, NodataTile
+from ki_geodaten.worker.orchestrator import run_job
+
+class _StubSegmenter:
+    def __init__(self, behaviours):
+        self._behaviours = list(behaviours)
+        self.encoder_token_count = lambda s: len(s.split())
+    def predict(self, tile, prompt):
+        b = self._behaviours.pop(0)
+        if isinstance(b, BaseException):
+            raise b
+        return b
+
+def _tile(row, col):
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+    affine = Affine(0.2, 0, 691000.0 + col * cfg.tile_step * 0.2,
+                    0, -0.2, 5336204.8 - row * cfg.tile_step * 0.2)
+    return Tile(
+        array=np.zeros((cfg.size, cfg.size, 3), dtype=np.uint8),
+        pixel_origin=(row * cfg.tile_step, col * cfg.tile_step),
+        size=cfg.size, center_margin=cfg.center_margin,
+        affine=affine, tile_row=row, tile_col=col,
+        nodata_mask=np.zeros((cfg.size, cfg.size), dtype=bool),
+    )
+
+def _nodata_tile(row, col):
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+    affine = Affine(0.2, 0, 691000.0 + col * cfg.tile_step * 0.2,
+                    0, -0.2, 5336204.8 - row * cfg.tile_step * 0.2)
+    return NodataTile(
+        tile_row=row, tile_col=col,
+        pixel_origin=(row * cfg.tile_step, col * cfg.tile_step),
+        size=cfg.size, center_margin=cfg.center_margin,
+        affine=affine,
+    )
+
+def _setup_job(tmp_path: Path) -> Path:
+    db = tmp_path / "j.db"
+    init_schema(db)
+    insert_job(
+        db, job_id="j1", prompt="building",
+        bbox_wgs84=[11.0, 48.0, 11.01, 48.01],
+        bbox_utm_snapped=[691000.0, 5335000.0, 692000.0, 5336000.0],
+        tile_preset=TilePreset.MEDIUM,
+    )
+    return db
+
+def test_orchestrator_happy_path_marks_ready(tmp_path, monkeypatch):
+    db = _setup_job(tmp_path)
+    mask = np.zeros((1024, 1024), dtype=bool)
+    mask[500:524, 500:524] = True
+    mr = MaskResult(mask=mask, score=0.9, box_pixel=(500, 500, 524, 524))
+    seg = _StubSegmenter([[mr]])
+    tiles = [_tile(0, 0)]
+
+    def fake_download(*a, **kw):
+        return Path("fake.vrt")
+    def fake_iter_tiles(*a, **kw):
+        return iter(tiles)
+
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.download_dop20", fake_download)
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.iter_tiles", fake_iter_tiles)
+
+    run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
+            wcs_url="", coverage_id="", max_pixels=4000,
+            origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
+            safe_center_nodata_threshold=0.0)
+
+    job = get_job(db, "j1")
+    assert job["status"] == JobStatus.READY_FOR_REVIEW
+    assert job["tile_total"] == 1
+    assert job["tile_completed"] == 1
+    assert len(get_polygons_for_job(db, "j1")) == 1
+
+def test_orchestrator_records_oom_as_nodata(tmp_path, monkeypatch):
+    # Use a dedicated stub exception and unconditionally override _is_cuda_oom,
+    # so the test is deterministic whether torch+CUDA is available or not.
+    db = _setup_job(tmp_path)
+    class FakeOOM(RuntimeError): pass
+    monkeypatch.setattr(
+        "ki_geodaten.worker.orchestrator._is_cuda_oom",
+        lambda e: isinstance(e, FakeOOM),
+    )
+    oom = FakeOOM("simulated")
+    seg = _StubSegmenter([oom])
+    tiles = [_tile(0, 0)]
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.download_dop20",
+                        lambda *a, **kw: Path("fake.vrt"))
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.iter_tiles",
+                        lambda *a, **kw: iter(tiles))
+
+    run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
+            wcs_url="", coverage_id="", max_pixels=4000,
+            origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
+            safe_center_nodata_threshold=0.0)
+
+    nd = get_nodata_for_job(db, "j1")
+    assert len(nd) == 1
+    assert nd[0]["reason"] == "OOM"
+    assert get_job(db, "j1")["status"] == JobStatus.READY_FOR_REVIEW
+
+def test_orchestrator_records_inference_error_as_nodata(tmp_path, monkeypatch):
+    db = _setup_job(tmp_path)
+    seg = _StubSegmenter([ValueError("boom")])
+    tiles = [_tile(0, 0)]
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.download_dop20",
+                        lambda *a, **kw: Path("fake.vrt"))
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.iter_tiles",
+                        lambda *a, **kw: iter(tiles))
+
+    run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
+            wcs_url="", coverage_id="", max_pixels=4000,
+            origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
+            safe_center_nodata_threshold=0.0)
+
+    nd = get_nodata_for_job(db, "j1")
+    assert nd[0]["reason"] == "INFERENCE_ERROR"
+
+def test_orchestrator_records_nodata_tile_without_invoking_segmenter(tmp_path, monkeypatch):
+    db = _setup_job(tmp_path)
+    seg = _StubSegmenter([])  # should NEVER be called
+    tiles = [_nodata_tile(0, 0)]
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.download_dop20",
+                        lambda *a, **kw: Path("fake.vrt"))
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.iter_tiles",
+                        lambda *a, **kw: iter(tiles))
+
+    run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
+            wcs_url="", coverage_id="", max_pixels=4000,
+            origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
+            safe_center_nodata_threshold=0.0)
+
+    nd = get_nodata_for_job(db, "j1")
+    assert nd[0]["reason"] == "NODATA_PIXELS"
+
+def test_orchestrator_catches_download_error_marks_failed(tmp_path, monkeypatch):
+    from ki_geodaten.pipeline.wcs_client import WCSError
+    db = _setup_job(tmp_path)
+    def fail_download(*a, **kw):
+        raise WCSError("WCS_TIMEOUT")
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.download_dop20", fail_download)
+
+    run_job(db, job_id="j1", segmenter=_StubSegmenter([]), data_root=tmp_path,
+            wcs_url="", coverage_id="", max_pixels=4000,
+            origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
+            safe_center_nodata_threshold=0.0)
+
+    job = get_job(db, "j1")
+    assert job["status"] == JobStatus.FAILED
+    assert job["error_reason"] == "WCS_TIMEOUT"
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/worker/test_orchestrator.py -v`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement**
+
+```python
+# ki_geodaten/worker/orchestrator.py
+from __future__ import annotations
+import json
+import logging
+import shutil
+import traceback
+from pathlib import Path
+
+import geopandas as gpd
+from shapely.wkb import dumps as wkb_dumps
+
+from ki_geodaten.jobs.store import (
+    update_status, insert_polygons, insert_nodata_region,
+    increment_tile_completed, increment_tile_failed,
+)
+from ki_geodaten.models import JobStatus, TilePreset, ErrorReason, NoDataReason
+from ki_geodaten.pipeline.wcs_client import download_dop20, WCSError
+from ki_geodaten.pipeline.tiler import (
+    TileConfig, Tile, NodataTile, iter_tiles, safe_center_polygon,
+)
+from ki_geodaten.pipeline.merger import keep_center_only, masks_to_polygons
+
+logger = logging.getLogger(__name__)
+
+def _is_cuda_oom(exc: BaseException) -> bool:
+    try:
+        import torch
+    except Exception:
+        return False
+    return isinstance(exc, torch.cuda.OutOfMemoryError)
+
+def _empty_cuda_cache() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+def _traceback_tail(exc: BaseException, n: int = 20) -> str:
+    tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    lines = tb.splitlines()
+    return "\n".join(lines[-n:])
+
+def _persist_polygons_for_tile(
+    db_path: Path, job_id: str, gdf: gpd.GeoDataFrame,
+) -> None:
+    if gdf is None or len(gdf) == 0:
+        return
+    rows = [
+        {
+            "geometry_wkb": wkb_dumps(row.geometry),
+            "score": float(row["score"]),
+            "source_tile_row": int(row["source_tile_row"]),
+            "source_tile_col": int(row["source_tile_col"]),
+        }
+        for _, row in gdf.iterrows()
+    ]
+    insert_polygons(db_path, job_id, rows)
+
+def _persist_safe_center_nodata(
+    db_path: Path, job_id: str, tile, reason: NoDataReason,
+) -> None:
+    poly = safe_center_polygon(tile)
+    insert_nodata_region(
+        db_path, job_id,
+        geometry_wkb=wkb_dumps(poly),
+        tile_row=tile.tile_row, tile_col=tile.tile_col,
+        reason=str(reason),
+    )
+
+def run_job(
+    db_path: Path, *, job_id: str, segmenter, data_root: Path,
+    wcs_url: str, coverage_id: str, max_pixels: int,
+    origin_x: float, origin_y: float, min_polygon_area_m2: float,
+    safe_center_nodata_threshold: float,
+) -> None:
+    """Spec §6: DOWNLOADING → INFERRING → READY_FOR_REVIEW (or FAILED).
+    Per-tile commits; segmenter is injected so tests can stub it."""
+    from ki_geodaten.jobs.store import get_job as _get_job
+    job = _get_job(db_path, job_id)
+    if job is None:
+        return
+    prompt = job["prompt"]
+    preset = TilePreset(job["tile_preset"])
+    cfg = TileConfig.from_preset(preset)
+    out_dir = data_root / "dop" / job_id
+
+    try:
+        update_status(db_path, job_id, JobStatus.DOWNLOADING, set_started=True)
+        aoi_utm = tuple(json.loads(job["bbox_utm_snapped"]))
+        # Download bbox = aoi + margin (caller had already prepared via prepare_download_bbox
+        # when the job was created; we re-apply here for robustness).
+        from ki_geodaten.pipeline.wcs_client import prepare_download_bbox
+        prepared = prepare_download_bbox(
+            *aoi_utm, preset=preset,
+            origin_x=origin_x, origin_y=origin_y,
+        )
+        vrt_path = download_dop20(
+            prepared.download_bbox, preset_center_margin_px=cfg.center_margin,
+            out_dir=out_dir, wcs_url=wcs_url, coverage_id=coverage_id,
+            max_pixels=max_pixels, origin_x=origin_x, origin_y=origin_y,
+        )
+        update_status(db_path, job_id, JobStatus.INFERRING, dop_vrt_path=str(vrt_path))
+
+        # Spec §5.2 requires lazy tile iteration. Counting via iter_grid() is
+        # pure arithmetic on src.width/src.height — no pixel reads.
+        import rasterio as _rio
+        from ki_geodaten.pipeline.tiler import iter_grid as _iter_grid
+        with _rio.open(vrt_path) as _src:
+            tile_total = sum(1 for _ in _iter_grid(_src, cfg))
+        update_status(db_path, job_id, JobStatus.INFERRING, tile_total=tile_total)
+
+        for tile in iter_tiles(
+            vrt_path, cfg,
+            safe_center_nodata_threshold=safe_center_nodata_threshold,
+        ):
+            if isinstance(tile, NodataTile):
+                _persist_safe_center_nodata(db_path, job_id, tile,
+                                            NoDataReason.NODATA_PIXELS)
+                increment_tile_failed(db_path, job_id)
+                continue
+            try:
+                masks = segmenter.predict(tile, prompt)
+            except Exception as exc:   # noqa: BLE001 — we intentionally cover all predict failures
+                reason = NoDataReason.OOM if _is_cuda_oom(exc) else NoDataReason.INFERENCE_ERROR
+                _persist_safe_center_nodata(db_path, job_id, tile, reason)
+                increment_tile_failed(db_path, job_id)
+                _empty_cuda_cache()
+                continue
+
+            try:
+                kept = keep_center_only(masks, tile)
+                gdf = masks_to_polygons(kept, tile, min_area_m2=min_polygon_area_m2)
+                _persist_polygons_for_tile(db_path, job_id, gdf)
+                increment_tile_completed(db_path, job_id)
+            except Exception as exc:
+                logger.exception("INVALID_GEOMETRY tile=%s/%s", tile.tile_row, tile.tile_col)
+                _persist_safe_center_nodata(db_path, job_id, tile,
+                                            NoDataReason.INVALID_GEOMETRY)
+                increment_tile_failed(db_path, job_id)
+            finally:
+                _empty_cuda_cache()
+
+        update_status(db_path, job_id, JobStatus.READY_FOR_REVIEW, set_finished=True)
+
+    except WCSError as exc:
+        reason = str(exc) if str(exc) in ("WCS_TIMEOUT", "WCS_HTTP_ERROR") else ErrorReason.WCS_HTTP_ERROR
+        update_status(
+            db_path, job_id, JobStatus.FAILED,
+            error_reason=str(reason), error_message=_traceback_tail(exc),
+            set_finished=True,
+        )
+        shutil.rmtree(out_dir, ignore_errors=True)
+    except Exception as exc:
+        update_status(
+            db_path, job_id, JobStatus.FAILED,
+            error_reason=str(ErrorReason.INFERENCE_ERROR),
+            error_message=_traceback_tail(exc), set_finished=True,
+        )
+        shutil.rmtree(out_dir, ignore_errors=True)
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/worker/test_orchestrator.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/worker/orchestrator.py tests/worker/test_orchestrator.py
+git commit -m "feat(worker): orchestrator with per-tile commits and three error layers"
+```
+
+---
+
+## Task 19: Worker Loop — Poll, Startup Cleanup, Self-Restart
+
+**Files:**
+- Create: `ki_geodaten/worker/loop.py`
+- Test: `tests/worker/test_loop.py`
+
+**See Spec §10.3** — startup hook marks DOWNLOADING/INFERRING jobs as FAILED, rigorously rmtree's orphan dirs under `data/dop/`. Worker exits cleanly after `MAX_JOBS_PER_WORKER` so the supervisor script re-launches it.
+
+- [ ] **Step 1: Write failing test**
+
+```python
+# tests/worker/test_loop.py
+import pytest
+from pathlib import Path
+from ki_geodaten.jobs.store import init_schema, insert_job, get_job, update_status
+from ki_geodaten.models import JobStatus, TilePreset
+from ki_geodaten.worker.loop import startup_cleanup, run_forever
+
+def test_startup_marks_incomplete_jobs_failed(tmp_path):
+    db = tmp_path / "j.db"
+    init_schema(db)
+    insert_job(db, job_id="j1", prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    update_status(db, "j1", JobStatus.DOWNLOADING, set_started=True)
+    startup_cleanup(db, data_root=tmp_path)
+    j = get_job(db, "j1")
+    assert j["status"] == JobStatus.FAILED
+    assert j["error_reason"] == "WORKER_RESTARTED"
+
+def test_startup_rmtree_removes_orphan_dirs(tmp_path):
+    db = tmp_path / "j.db"
+    init_schema(db)
+    # Job that does NOT exist → its dop-dir is an orphan
+    orphan = tmp_path / "dop" / "ghost-job"
+    orphan.mkdir(parents=True)
+    (orphan / "chunk_0_0.tif").write_bytes(b"x")
+    # Active job dir must be preserved
+    insert_job(db, job_id="j_active", prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    update_status(db, "j_active", JobStatus.DOWNLOADING, set_started=True)
+    active_dir = tmp_path / "dop" / "j_active"
+    active_dir.mkdir(parents=True)
+    (active_dir / "chunk_0_0.tif").write_bytes(b"y")
+
+    # First call re-marks j_active as FAILED; next pass removes its dir because it's now inactive
+    startup_cleanup(db, data_root=tmp_path)
+    # After the DB-pass, j_active is FAILED. Re-run the disk pass (simulating after restart):
+    startup_cleanup(db, data_root=tmp_path)
+    assert not orphan.exists()
+    assert not active_dir.exists()
+
+def test_run_forever_exits_after_max_jobs(tmp_path, monkeypatch):
+    db = tmp_path / "j.db"
+    init_schema(db)
+    insert_job(db, job_id="j1", prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    insert_job(db, job_id="j2", prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    calls: list[str] = []
+
+    def fake_run_job(*a, **kw):
+        calls.append(kw["job_id"])
+        update_status(db, kw["job_id"], JobStatus.READY_FOR_REVIEW, set_finished=True)
+
+    monkeypatch.setattr("ki_geodaten.worker.loop.run_job", fake_run_job)
+
+    class _StubSegmenter: ...
+    run_forever(
+        db_path=db, data_root=tmp_path,
+        segmenter_factory=lambda: _StubSegmenter(),
+        wcs_url="", coverage_id="", max_pixels=4000,
+        origin_x=0.0, origin_y=0.0,
+        min_polygon_area_m2=1.0, safe_center_nodata_threshold=0.0,
+        max_jobs=2, poll_interval=0.01, idle_exit_after=2,
+    )
+    assert calls == ["j1", "j2"]
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/worker/test_loop.py -v`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement**
+
+```python
+# ki_geodaten/worker/loop.py
+from __future__ import annotations
+import logging
+import shutil
+import time
+from pathlib import Path
+from typing import Callable
+
+from ki_geodaten.jobs.store import (
+    abort_incomplete_jobs_on_startup, claim_next_pending_job,
+    connect,
+)
+from ki_geodaten.worker.orchestrator import run_job
+
+logger = logging.getLogger(__name__)
+
+def _active_job_ids(db_path: Path) -> set[str]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE status IN ('PENDING','DOWNLOADING','INFERRING')"
+        ).fetchall()
+    return {r["id"] for r in rows}
+
+def startup_cleanup(db_path: Path, *, data_root: Path) -> None:
+    """Spec §10.3: 1) abort DOWNLOADING/INFERRING 2) rmtree orphan disk dirs."""
+    abort_incomplete_jobs_on_startup(db_path)
+    active = _active_job_ids(db_path)
+    dop_root = data_root / "dop"
+    if not dop_root.exists():
+        return
+    for child in dop_root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name not in active:
+            shutil.rmtree(child, ignore_errors=True)
+
+def run_forever(
+    *, db_path: Path, data_root: Path,
+    segmenter_factory: Callable[[], object],
+    wcs_url: str, coverage_id: str, max_pixels: int,
+    origin_x: float, origin_y: float,
+    min_polygon_area_m2: float, safe_center_nodata_threshold: float,
+    max_jobs: int, poll_interval: float,
+    idle_exit_after: int | None = None,
+) -> None:
+    """Poll loop. Exits cleanly after max_jobs (supervisor restarts us).
+    idle_exit_after: exit after N consecutive empty polls (for tests)."""
+    startup_cleanup(db_path, data_root=data_root)
+    segmenter = segmenter_factory()
+    processed = 0
+    idle_polls = 0
+    while processed < max_jobs:
+        job = claim_next_pending_job(db_path)
+        if job is None:
+            idle_polls += 1
+            if idle_exit_after is not None and idle_polls >= idle_exit_after:
+                return
+            time.sleep(poll_interval)
+            continue
+        idle_polls = 0
+        try:
+            run_job(
+                db_path, job_id=job["id"], segmenter=segmenter,
+                data_root=data_root,
+                wcs_url=wcs_url, coverage_id=coverage_id,
+                max_pixels=max_pixels,
+                origin_x=origin_x, origin_y=origin_y,
+                min_polygon_area_m2=min_polygon_area_m2,
+                safe_center_nodata_threshold=safe_center_nodata_threshold,
+            )
+        except Exception:
+            logger.exception("job crashed outside orchestrator try/except: %s", job["id"])
+        processed += 1
+
+def main() -> None:   # pragma: no cover
+    import os
+    from ki_geodaten.config import Settings
+    from ki_geodaten.pipeline.segmenter import Sam3Segmenter
+    settings = Settings()
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    db_path = Path("data/jobs.db")
+    run_forever(
+        db_path=db_path, data_root=Path("data"),
+        segmenter_factory=lambda: Sam3Segmenter(
+            settings.SAM3_CHECKPOINT,
+            iou_threshold=settings.LOCAL_MASK_NMS_IOU,
+            containment_ratio=settings.LOCAL_MASK_CONTAINMENT_RATIO,
+        ),
+        wcs_url=settings.WCS_URL, coverage_id=settings.WCS_COVERAGE_ID,
+        max_pixels=settings.WCS_MAX_PIXELS,
+        origin_x=settings.WCS_GRID_ORIGIN_X, origin_y=settings.WCS_GRID_ORIGIN_Y,
+        min_polygon_area_m2=settings.MIN_POLYGON_AREA_M2,
+        safe_center_nodata_threshold=settings.SAFE_CENTER_NODATA_THRESHOLD,
+        max_jobs=settings.MAX_JOBS_PER_WORKER,
+        poll_interval=settings.WORKER_POLL_INTERVAL_SEC,
+    )
+
+if __name__ == "__main__":   # pragma: no cover
+    main()
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/worker/test_loop.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/worker/loop.py tests/worker/test_loop.py
+git commit -m "feat(worker): poll loop, startup DB+disk cleanup, self-restart after N jobs"
+```
+
+---
+
+## Task 20: Retention Cleanup (`jobs/retention.py`)
+
+**Files:**
+- Create: `ki_geodaten/jobs/retention.py`
+- Test: `tests/jobs/test_retention.py`
+
+**See Spec §NFR-7** — DELETE FAILED/EXPORTED jobs older than RETENTION_DAYS; CASCADE drops polygons + nodata_regions; unlink `.gpkg` files; `VACUUM`.
+
+- [ ] **Step 1: Write failing test**
+
+```python
+# tests/jobs/test_retention.py
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import pytest
+from ki_geodaten.jobs.store import (
+    connect, init_schema, insert_job, insert_polygons, update_status, get_job,
+)
+from ki_geodaten.jobs.retention import cleanup_old_jobs
+from ki_geodaten.models import JobStatus, TilePreset
+
+def _set_finished_at(db_path: Path, job_id: str, when: datetime) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET finished_at = ? WHERE id = ?",
+            (when.isoformat(), job_id),
+        )
+
+def test_cleanup_deletes_old_failed_and_exported(tmp_path):
+    db = tmp_path / "j.db"
+    results = tmp_path / "results"
+    results.mkdir()
+    init_schema(db)
+    for jid in ("old_failed", "old_exported", "recent_exported", "active"):
+        insert_job(db, job_id=jid, prompt="p",
+                   bbox_wgs84=[0,0,1,1], bbox_utm_snapped=[0,0,1,1],
+                   tile_preset=TilePreset.MEDIUM)
+    update_status(db, "old_failed", JobStatus.FAILED,
+                  error_reason="WCS_TIMEOUT", set_finished=True)
+    update_status(db, "old_exported", JobStatus.EXPORTED, set_finished=True,
+                  gpkg_path=str(results / "old_exported.gpkg"))
+    (results / "old_exported.gpkg").write_bytes(b"gpkg")
+    update_status(db, "recent_exported", JobStatus.EXPORTED, set_finished=True,
+                  gpkg_path=str(results / "recent_exported.gpkg"))
+    (results / "recent_exported.gpkg").write_bytes(b"gpkg")
+
+    now = datetime.now(timezone.utc)
+    _set_finished_at(db, "old_failed", now - timedelta(days=10))
+    _set_finished_at(db, "old_exported", now - timedelta(days=10))
+    _set_finished_at(db, "recent_exported", now - timedelta(days=1))
+
+    deleted = cleanup_old_jobs(db, results_dir=results, retention_days=7)
+    assert set(deleted) == {"old_failed", "old_exported"}
+    assert get_job(db, "old_failed") is None
+    assert get_job(db, "old_exported") is None
+    assert get_job(db, "recent_exported") is not None
+    assert get_job(db, "active") is not None
+    assert not (results / "old_exported.gpkg").exists()
+    assert (results / "recent_exported.gpkg").exists()
+
+def test_cleanup_cascades_to_polygons(tmp_path):
+    db = tmp_path / "j.db"
+    results = tmp_path / "results"
+    results.mkdir()
+    init_schema(db)
+    insert_job(db, job_id="old", prompt="p",
+               bbox_wgs84=[0,0,1,1], bbox_utm_snapped=[0,0,1,1],
+               tile_preset=TilePreset.MEDIUM)
+    insert_polygons(db, "old", [
+        {"geometry_wkb": b"a", "score": 0.9, "source_tile_row": 0, "source_tile_col": 0}
+    ])
+    update_status(db, "old", JobStatus.FAILED, error_reason="OOM", set_finished=True)
+    _set_finished_at(db, "old", datetime.now(timezone.utc) - timedelta(days=10))
+    cleanup_old_jobs(db, results_dir=results, retention_days=7)
+    with connect(db) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM polygons WHERE job_id='old'").fetchone()[0]
+    assert n == 0
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/jobs/test_retention.py -v`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement**
+
+```python
+# ki_geodaten/jobs/retention.py
+from __future__ import annotations
+import logging
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+from ki_geodaten.jobs.store import connect
+
+logger = logging.getLogger(__name__)
+
+def cleanup_old_jobs(
+    db_path: Path, *, results_dir: Path, retention_days: int,
+) -> list[str]:
+    """Spec §NFR-7. Returns list of deleted job IDs."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=retention_days)).isoformat()
+    with connect(db_path) as conn:
+        conn.execute("BEGIN")
+        rows = conn.execute(
+            "SELECT id, gpkg_path FROM jobs"
+            " WHERE status IN ('FAILED','EXPORTED') AND finished_at IS NOT NULL"
+            " AND finished_at < ?",
+            (cutoff,),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        gpkg_paths = [r["gpkg_path"] for r in rows if r["gpkg_path"]]
+        if ids:
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", ids)
+        conn.execute("COMMIT")
+        conn.execute("VACUUM")
+    for path_str in gpkg_paths:
+        p = Path(path_str)
+        try:
+            p.unlink(missing_ok=True)
+        except OSError:
+            logger.warning("retention: failed to unlink %s", p)
+    return ids
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/jobs/test_retention.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/jobs/retention.py tests/jobs/test_retention.py
+git commit -m "feat(jobs): retention cleanup for FAILED/EXPORTED jobs"
+```
+
+---
+
+## Task 21: FastAPI App Factory & Process Pool Executor
+
+**Files:**
+- Create: `ki_geodaten/app/main.py`
+- Test: `tests/app/test_main.py`
+
+**See Spec §8** — dedicated `ProcessPoolExecutor` (small; 2 workers) for GeoJSON serialization to keep Event-Loop *and* Web-Threadpool free. Lifespan initializes DB schema and starts/stops the executor.
+
+**Injection hooks:** `create_app(executor_factory=..., token_counter=...)` both accept optional overrides so tests can substitute a `ThreadPoolExecutor` (avoiding slow subprocess spawn on every test) and a deterministic tokenizer stub. Production leaves them at defaults.
+
+**Token-counter in production:** per Spec §5.3/§8 the limit must be checked on the **real, templatized encoder sequence**, not whitespace-split chars. The app process does NOT hold SAM on GPU, but can load just the text tokenizer on CPU (a few MB). The lifespan below wires this: if `SAM3_CHECKPOINT` is available, it loads the tokenizer via `Sam3Segmenter(..., device="cpu").load()` and exposes `encoder_token_count` as the production counter. If loading fails (e.g. sam3 not installed yet during development), it falls back to whitespace split **and logs a warning** — *never* silent, because the spec invariant is that an over-long prompt must reach HTTP 422.
+
+- [ ] **Step 1: Write failing test**
+
+```python
+# tests/app/test_main.py
+from fastapi.testclient import TestClient
+from pathlib import Path
+from ki_geodaten.app.main import create_app
+
+def test_app_starts_and_serves_index(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = create_app()
+    with TestClient(app) as c:
+        r = c.get("/")
+        assert r.status_code == 200
+        assert "text/html" in r.headers["content-type"]
+
+def test_app_lifespan_initializes_db(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = create_app()
+    with TestClient(app) as c:
+        pass
+    assert (tmp_path / "data" / "jobs.db").exists()
+
+def test_app_has_geojson_executor(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = create_app()
+    with TestClient(app) as c:
+        pass
+        assert hasattr(app.state, "geojson_executor")
+
+def test_executor_factory_override_used(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.chdir(tmp_path)
+    sentinel = ThreadPoolExecutor(max_workers=1)
+    app = create_app(executor_factory=lambda: sentinel)
+    with TestClient(app) as c:
+        assert app.state.geojson_executor is sentinel
+
+def test_token_counter_override_used(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = create_app(token_counter=lambda s: 42)
+    with TestClient(app):
+        assert app.state.token_counter("anything") == 42
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/app/test_main.py -v`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement**
+
+```python
+# ki_geodaten/app/main.py
+from __future__ import annotations
+import logging
+import threading
+from concurrent.futures import Executor, ProcessPoolExecutor
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Callable
+
+from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
+from fastapi import Request
+from fastapi.responses import HTMLResponse
+
+from ki_geodaten.config import Settings
+from ki_geodaten.jobs.store import init_schema
+
+logger = logging.getLogger(__name__)
+
+_BASE_DIR = Path(__file__).parent
+
+TokenCounter = Callable[[str], int]
+ExecutorFactory = Callable[[], Executor]
+
+def _data_paths(root: Path) -> tuple[Path, Path, Path]:
+    data_root = root / "data"
+    data_root.mkdir(parents=True, exist_ok=True)
+    (data_root / "dop").mkdir(exist_ok=True)
+    (data_root / "results").mkdir(exist_ok=True)
+    return data_root, data_root / "jobs.db", data_root / "results"
+
+def _default_executor_factory() -> Executor:
+    return ProcessPoolExecutor(max_workers=2)
+
+def _default_token_counter(settings: Settings) -> TokenCounter:
+    """Spec §5.3/§8: token limit must be checked on the FINAL encoder sequence.
+    Prefer loading the real SAM text tokenizer on CPU. Fall back with a loud
+    warning — we must NEVER silently under-count tokens."""
+    try:
+        from ki_geodaten.pipeline.segmenter import Sam3Segmenter
+        seg = Sam3Segmenter(settings.SAM3_CHECKPOINT, device="cpu")
+        seg.load()
+        return seg.encoder_token_count
+    except Exception as exc:   # noqa: BLE001 — covers missing sam3 in dev
+        logger.warning(
+            "Falling back to whitespace-split token counter "
+            "(real encoder unavailable: %s). Spec §5.3 invariant NOT enforced.",
+            exc,
+        )
+        return lambda s: len(s.split())
+
+def lifespan_factory(
+    executor_factory: ExecutorFactory,
+    token_counter: TokenCounter | None,
+):
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        settings: Settings = app.state.settings
+        data_root, db_path, results_dir = _data_paths(Path.cwd())
+        init_schema(db_path)
+        app.state.db_path = db_path
+        app.state.data_root = data_root
+        app.state.results_dir = results_dir
+        app.state.export_lock = threading.Lock()
+        app.state.geojson_cache = {}             # (job_id, revision, target) -> dict
+        app.state.geojson_executor = executor_factory()
+        app.state.token_counter = (
+            token_counter if token_counter is not None
+            else _default_token_counter(settings)
+        )
+        try:
+            yield
+        finally:
+            app.state.geojson_executor.shutdown(wait=False, cancel_futures=True)
+    return lifespan
+
+def create_app(
+    settings: Settings | None = None,
+    *,
+    executor_factory: ExecutorFactory = _default_executor_factory,
+    token_counter: TokenCounter | None = None,
+) -> FastAPI:
+    settings = settings or Settings()
+    app = FastAPI(
+        title="Text-to-Polygon Pipeline",
+        lifespan=lifespan_factory(executor_factory, token_counter),
+    )
+    app.state.settings = settings
+
+    templates = Jinja2Templates(directory=str(_BASE_DIR / "templates"))
+    app.state.templates = templates
+    app.mount(
+        "/static",
+        StaticFiles(directory=str(_BASE_DIR / "static")),
+        name="static",
+    )
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index(request: Request):
+        return templates.TemplateResponse("index.html", {"request": request})
+
+    from ki_geodaten.app.routes.jobs import router as jobs_router
+    from ki_geodaten.app.routes.geojson import router as geojson_router
+    app.include_router(jobs_router)
+    app.include_router(geojson_router)
+    return app
+
+app = create_app()   # uvicorn entrypoint
+```
+
+Also create a minimal placeholder template now (will be expanded in Task 27):
+
+```html
+<!-- ki_geodaten/app/templates/index.html -->
+<!doctype html><title>Text-to-Polygon</title><h1>ki-geodaten</h1>
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/app/test_main.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/app/main.py ki_geodaten/app/templates/index.html tests/app/test_main.py
+git commit -m "feat(app): FastAPI factory, lifespan, ProcessPoolExecutor for GeoJSON"
+```
+
+---
+
+## Task 22: `POST /jobs` — Bayern Fence + UTM Area Check + Token Limit
+
+**Files:**
+- Create: `ki_geodaten/app/routes/jobs.py`
+- Test: `tests/app/test_routes_jobs.py`
+
+**See Spec §8** — geographic fence on `BAYERN_BBOX_WGS84`, area check on **EPSG:25832 bbox** (NOT WGS84 degrees), prompt length validated on final templatized encoder sequence.
+
+Token count checking reads `app.state.token_counter`, which is always set by `lifespan` (production: real SAM tokenizer on CPU, with a warning-logged whitespace fallback if sam3 isn't installed; tests: inject via `create_app(token_counter=...)`, see Task 21).
+
+- [ ] **Step 1: Write failing test**
+
+```python
+# tests/app/test_routes_jobs.py
+import uuid
+import pytest
+from fastapi.testclient import TestClient
+from ki_geodaten.app.main import create_app
+from ki_geodaten.jobs.store import get_job
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.chdir(tmp_path)
+    # Use a ThreadPoolExecutor in tests (ProcessPool subprocess spawn is slow
+    # on Windows and the executor doesn't need process isolation here).
+    # Inject a deterministic 1-token-per-word counter for predictable limits.
+    app = create_app(
+        executor_factory=lambda: ThreadPoolExecutor(max_workers=2),
+        token_counter=lambda s: len(s.split()),
+    )
+    with TestClient(app) as c:
+        yield c, app
+
+def _munich_bbox():
+    return [11.55, 48.13, 11.56, 48.14]  # ~800m × ~1.1km; just under 1 km²
+
+def _too_big_bbox():
+    return [11.55, 48.13, 11.60, 48.20]  # way over 1 km²
+
+def _outside_bayern_bbox():
+    return [13.30, 52.40, 13.31, 52.41]  # Berlin
+
+def test_post_jobs_accepts_valid(client):
+    c, app = client
+    r = c.post("/jobs", json={"prompt": "building", "bbox_wgs84": _munich_bbox()})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "PENDING"
+    uuid.UUID(body["id"])
+    assert get_job(app.state.db_path, body["id"]) is not None
+
+def test_post_jobs_defaults_preset_medium(client):
+    c, app = client
+    r = c.post("/jobs", json={"prompt": "car", "bbox_wgs84": _munich_bbox()})
+    jid = r.json()["id"]
+    job = get_job(app.state.db_path, jid)
+    assert job["tile_preset"] == "medium"
+
+def test_post_jobs_rejects_outside_bayern(client):
+    c, _ = client
+    r = c.post("/jobs", json={"prompt": "building", "bbox_wgs84": _outside_bayern_bbox()})
+    assert r.status_code == 422
+
+def test_post_jobs_rejects_area_over_1sqkm(client):
+    c, _ = client
+    r = c.post("/jobs", json={"prompt": "building", "bbox_wgs84": _too_big_bbox()})
+    assert r.status_code == 422
+
+def test_post_jobs_rejects_empty_prompt_after_strip(client):
+    c, _ = client
+    r = c.post("/jobs", json={"prompt": "   ", "bbox_wgs84": _munich_bbox()})
+    assert r.status_code == 422
+
+def test_post_jobs_rejects_token_count_over_limit(client):
+    c, app = client
+    app.state.token_counter = lambda s: 999
+    r = c.post("/jobs", json={"prompt": "solar panel", "bbox_wgs84": _munich_bbox()})
+    assert r.status_code == 422
+
+def test_post_jobs_rejects_inverted_bbox(client):
+    c, _ = client
+    r = c.post("/jobs", json={"prompt": "building", "bbox_wgs84": [11.6, 48.2, 11.5, 48.1]})
+    assert r.status_code == 422
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/app/test_routes_jobs.py -v`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement**
+
+```python
+# ki_geodaten/app/routes/jobs.py
+from __future__ import annotations
+import json
+import uuid
+from fastapi import APIRouter, HTTPException, Request
+
+from ki_geodaten.config import Settings
+from ki_geodaten.jobs.store import insert_job
+from ki_geodaten.models import CreateJobRequest, TilePreset
+from ki_geodaten.pipeline.geo_utils import transform_bbox_wgs84_to_utm
+from ki_geodaten.pipeline.wcs_client import prepare_download_bbox
+
+router = APIRouter()
+
+def _within_bayern(
+    bbox: list[float], bayern: tuple[float, float, float, float],
+) -> bool:
+    lon_min, lat_min, lon_max, lat_max = bayern
+    return (
+        bbox[0] >= lon_min and bbox[2] <= lon_max
+        and bbox[1] >= lat_min and bbox[3] <= lat_max
+    )
+
+def _utm_area_km2(bbox_wgs84: list[float]) -> float:
+    minx, miny, maxx, maxy = transform_bbox_wgs84_to_utm(*bbox_wgs84)
+    return (maxx - minx) * (maxy - miny) / 1_000_000.0
+
+@router.post("/jobs")
+async def create_job(req: CreateJobRequest, request: Request):
+    settings: Settings = request.app.state.settings
+    bbox = req.bbox_wgs84
+
+    if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+        raise HTTPException(422, detail="bbox_wgs84 must have minx<maxx and miny<maxy")
+
+    if not _within_bayern(bbox, settings.BAYERN_BBOX_WGS84):
+        raise HTTPException(
+            422, detail=f"bbox must be within Bayern WGS84 bounds "
+                        f"{settings.BAYERN_BBOX_WGS84}")
+
+    area_km2 = _utm_area_km2(bbox)
+    if area_km2 > settings.MAX_BBOX_AREA_KM2:
+        raise HTTPException(
+            422, detail=f"bbox area {area_km2:.3f} km² exceeds limit "
+                        f"{settings.MAX_BBOX_AREA_KM2} km²")
+
+    prompt = req.prompt.strip()
+    if not prompt:
+        raise HTTPException(422, detail="prompt must be non-empty after strip()")
+    if len(prompt) > settings.MAX_PROMPT_CHARS:
+        raise HTTPException(
+            422, detail=f"prompt exceeds {settings.MAX_PROMPT_CHARS} chars")
+
+    counter = request.app.state.token_counter
+    token_count = counter(prompt)
+    if token_count > settings.MAX_ENCODER_CONTEXT_TOKENS:
+        raise HTTPException(
+            422,
+            detail=f"prompt encodes to {token_count} tokens, exceeds "
+                   f"{settings.MAX_ENCODER_CONTEXT_TOKENS}; use a shorter noun phrase",
+        )
+
+    # Grid-snap AOI to UTM (NOT expanded; expansion happens inside worker)
+    utm_bounds = transform_bbox_wgs84_to_utm(*bbox)
+    prepared = prepare_download_bbox(
+        *utm_bounds, preset=req.tile_preset,
+        origin_x=settings.WCS_GRID_ORIGIN_X, origin_y=settings.WCS_GRID_ORIGIN_Y,
+    )
+
+    job_id = str(uuid.uuid4())
+    insert_job(
+        request.app.state.db_path,
+        job_id=job_id, prompt=prompt,
+        bbox_wgs84=list(bbox),
+        bbox_utm_snapped=list(prepared.aoi_bbox),
+        tile_preset=req.tile_preset,
+    )
+    return {"id": job_id, "status": "PENDING"}
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/app/test_routes_jobs.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/app/routes/jobs.py tests/app/test_routes_jobs.py
+git commit -m "feat(api): POST /jobs with Bayern fence, UTM area check, encoder token limit"
+```
+
+---
+
+## Task 23: `GET /jobs`, `GET /jobs/{id}`, `GET /jobs/{id}/export.gpkg`
+
+**Files:**
+- Modify: `ki_geodaten/app/routes/jobs.py` (append)
+- Test: `tests/app/test_routes_jobs.py` (append)
+
+**See Spec §8** — list + detail expose `validation_revision`, `exported_revision`, derived `export_stale`. Download streams the `.gpkg` file.
+
+- [ ] **Step 1: Append failing tests**
+
+```python
+# tests/app/test_routes_jobs.py (append)
+from ki_geodaten.jobs.store import update_status
+from ki_geodaten.models import JobStatus
+
+def test_list_jobs_returns_revision_fields(client):
+    c, app = client
+    jid = c.post("/jobs", json={"prompt": "building", "bbox_wgs84": _munich_bbox()}).json()["id"]
+    r = c.get("/jobs")
+    assert r.status_code == 200
+    body = r.json()
+    entry = next(e for e in body if e["id"] == jid)
+    assert entry["validation_revision"] == 0
+    assert entry["exported_revision"] is None
+    assert entry["export_stale"] is True
+    # bbox_wgs84 must be a parsed array, not a JSON string
+    assert entry["bbox_wgs84"] == _munich_bbox()
+
+def test_get_job_detail(client):
+    c, app = client
+    jid = c.post("/jobs", json={"prompt": "building", "bbox_wgs84": _munich_bbox()}).json()["id"]
+    r = c.get(f"/jobs/{jid}")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["id"] == jid
+    assert body["status"] == "PENDING"
+    assert "tile_total" in body
+
+def test_get_job_404(client):
+    c, _ = client
+    r = c.get("/jobs/nonexistent")
+    assert r.status_code == 404
+
+def test_export_gpkg_download(client, tmp_path):
+    c, app = client
+    jid = c.post("/jobs", json={"prompt": "b", "bbox_wgs84": _munich_bbox()}).json()["id"]
+    gpkg = app.state.results_dir / f"{jid}.gpkg"
+    gpkg.write_bytes(b"PRAGMA")
+    update_status(app.state.db_path, jid, JobStatus.EXPORTED,
+                  gpkg_path=str(gpkg), set_finished=True)
+    r = c.get(f"/jobs/{jid}/export.gpkg")
+    assert r.status_code == 200
+    assert r.content == b"PRAGMA"
+
+def test_export_gpkg_missing_file_404(client):
+    c, app = client
+    jid = c.post("/jobs", json={"prompt": "b", "bbox_wgs84": _munich_bbox()}).json()["id"]
+    r = c.get(f"/jobs/{jid}/export.gpkg")
+    assert r.status_code == 404
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/app/test_routes_jobs.py -v`
+Expected: new tests FAIL.
+
+- [ ] **Step 3: Append implementation**
+
+```python
+# ki_geodaten/app/routes/jobs.py (append)
+from fastapi.responses import FileResponse
+from pathlib import Path
+from ki_geodaten.jobs.store import list_jobs, get_job
+
+_JOB_VIEW_FIELDS = (
+    "id", "prompt", "tile_preset", "status",
+    "error_reason", "error_message",
+    "tile_completed", "tile_total", "tile_failed",
+    "validation_revision", "exported_revision",
+    "created_at", "started_at", "finished_at",
+    "bbox_wgs84",
+)
+
+def _job_view(job: dict) -> dict:
+    view = {k: job.get(k) for k in _JOB_VIEW_FIELDS}
+    # bbox_wgs84 is stored as a JSON string in SQLite; UI expects an array.
+    if view.get("bbox_wgs84"):
+        view["bbox_wgs84"] = json.loads(view["bbox_wgs84"])
+    exported = job.get("exported_revision")
+    validation = job.get("validation_revision") or 0
+    view["export_stale"] = exported is None or exported < validation
+    return view
+
+@router.get("/jobs")
+async def list_jobs_endpoint(request: Request):
+    rows = list_jobs(request.app.state.db_path)
+    return [_job_view(j) for j in rows]
+
+@router.get("/jobs/{job_id}")
+async def get_job_endpoint(job_id: str, request: Request):
+    job = get_job(request.app.state.db_path, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    return _job_view(job)
+
+@router.get("/jobs/{job_id}/export.gpkg")
+async def download_gpkg(job_id: str, request: Request):
+    job = get_job(request.app.state.db_path, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    path = job.get("gpkg_path")
+    if not path or not Path(path).exists():
+        raise HTTPException(404, "gpkg not yet generated")
+    return FileResponse(
+        path, media_type="application/geopackage+sqlite3",
+        filename=f"{job_id}.gpkg",
+    )
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/app/test_routes_jobs.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/app/routes/jobs.py tests/app/test_routes_jobs.py
+git commit -m "feat(api): GET /jobs, /jobs/{id}, /jobs/{id}/export.gpkg"
+```
+
+---
+
+## Task 24: `POST /jobs/{id}/polygons/validate_bulk`
+
+**Files:**
+- Modify: `ki_geodaten/app/routes/jobs.py` (append)
+- Test: `tests/app/test_routes_jobs.py` (append)
+
+**See Spec §8** — status gate (`READY_FOR_REVIEW` or `EXPORTED` only), `executemany`, increments `validation_revision`.
+
+- [ ] **Step 1: Append failing tests**
+
+```python
+# tests/app/test_routes_jobs.py (append)
+from ki_geodaten.jobs.store import insert_polygons
+
+def _make_reviewable_job(app, c, n_polys=3, status=JobStatus.READY_FOR_REVIEW) -> str:
+    jid = c.post("/jobs", json={"prompt": "b", "bbox_wgs84": _munich_bbox()}).json()["id"]
+    insert_polygons(app.state.db_path, jid, [
+        {"geometry_wkb": b"x", "score": 0.9, "source_tile_row": 0, "source_tile_col": i}
+        for i in range(n_polys)
+    ])
+    update_status(app.state.db_path, jid, status, set_finished=True)
+    return jid
+
+def test_validate_bulk_happy_path(client):
+    c, app = client
+    jid = _make_reviewable_job(app, c, n_polys=3)
+    r = c.post(
+        f"/jobs/{jid}/polygons/validate_bulk",
+        json={"updates": [{"pid": 1, "validation": "REJECTED"},
+                          {"pid": 2, "validation": "REJECTED"}]},
+    )
+    assert r.status_code == 200
+    assert r.json()["updated"] == 2
+    assert c.get(f"/jobs/{jid}").json()["validation_revision"] == 1
+
+def test_validate_bulk_rejects_pending_job(client):
+    c, app = client
+    jid = c.post("/jobs", json={"prompt": "b", "bbox_wgs84": _munich_bbox()}).json()["id"]
+    r = c.post(
+        f"/jobs/{jid}/polygons/validate_bulk",
+        json={"updates": [{"pid": 1, "validation": "REJECTED"}]},
+    )
+    assert r.status_code == 409
+
+def test_validate_bulk_allowed_on_exported_job(client):
+    c, app = client
+    jid = _make_reviewable_job(app, c, status=JobStatus.EXPORTED)
+    r = c.post(
+        f"/jobs/{jid}/polygons/validate_bulk",
+        json={"updates": [{"pid": 1, "validation": "REJECTED"}]},
+    )
+    assert r.status_code == 200
+
+def test_validate_bulk_job_not_found(client):
+    c, _ = client
+    r = c.post(
+        "/jobs/nope/polygons/validate_bulk",
+        json={"updates": [{"pid": 1, "validation": "REJECTED"}]},
+    )
+    assert r.status_code == 404
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/app/test_routes_jobs.py -v`
+Expected: new tests FAIL.
+
+- [ ] **Step 3: Append implementation**
+
+```python
+# ki_geodaten/app/routes/jobs.py (append)
+from ki_geodaten.models import ValidateBulkRequest
+from ki_geodaten.jobs.store import validate_bulk
+
+_REVIEWABLE = {"READY_FOR_REVIEW", "EXPORTED"}
+
+@router.post("/jobs/{job_id}/polygons/validate_bulk")
+async def validate_bulk_endpoint(
+    job_id: str, req: ValidateBulkRequest, request: Request,
+):
+    job = get_job(request.app.state.db_path, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in _REVIEWABLE:
+        raise HTTPException(
+            409, f"job status {job['status']!s} does not allow validation",
+        )
+    updates = [u.model_dump() for u in req.updates]
+    updated = validate_bulk(request.app.state.db_path, job_id, updates)
+    # Invalidate polygon GeoJSON cache for this job
+    cache = request.app.state.geojson_cache
+    for key in list(cache.keys()):
+        if key[0] == job_id and key[2] == "polygons":
+            cache.pop(key, None)
+    return {"ok": True, "updated": updated}
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/app/test_routes_jobs.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/app/routes/jobs.py tests/app/test_routes_jobs.py
+git commit -m "feat(api): validate_bulk with status gate and revision bump"
+```
+
+---
+
+## Task 25: `POST /jobs/{id}/export` — Serialized Lock, exported_revision, Chunk Cleanup
+
+**Files:**
+- Modify: `ki_geodaten/app/routes/jobs.py` (append)
+- Test: `tests/app/test_routes_jobs.py` (append)
+
+**See Spec §8** — module-wide `threading.Lock` around `export_two_layer_gpkg` (GDAL/Fiona are not thread-safe). Re-export allowed from `EXPORTED`. On success: `status='EXPORTED'`, `exported_revision = validation_revision`, rmtree `data/dop/{job_id}`.
+
+**Critical:** this endpoint is declared as `def` (not `async def`). FastAPI routes sync functions to its threadpool — essential, because `export_two_layer_gpkg` holds the GIL-releasing GDAL/Fiona calls for multiple seconds. If it were `async def`, the blocking work would freeze the event loop and block ALL other requests (status polls, GeoJSON fetches) until export finishes. The `threading.Lock` then correctly serializes concurrent threadpool workers.
+
+- [ ] **Step 1: Append failing tests**
+
+```python
+# tests/app/test_routes_jobs.py (append)
+import threading
+from pathlib import Path
+import rasterio
+from shapely.geometry import Polygon
+from shapely.wkb import dumps as wkb_dumps
+
+def _insert_real_polygon(app, jid):
+    from ki_geodaten.jobs.store import insert_polygons
+    poly = Polygon([(691100, 5335100), (691200, 5335100),
+                    (691200, 5335200), (691100, 5335200)])
+    insert_polygons(app.state.db_path, jid, [
+        {"geometry_wkb": wkb_dumps(poly), "score": 0.9,
+         "source_tile_row": 0, "source_tile_col": 0}
+    ])
+    update_status(app.state.db_path, jid, JobStatus.READY_FOR_REVIEW,
+                  set_finished=True)
+
+def _post_real_bbox(c):
+    # UTM 691000..692000 / 5335000..5336000 is inside Munich-range wgs84 bbox
+    return c.post("/jobs", json={
+        "prompt": "building", "bbox_wgs84": [11.55, 48.13, 11.56, 48.14],
+    }).json()["id"]
+
+def test_export_happy_path_sets_revision_and_file(client, tmp_path):
+    c, app = client
+    jid = _post_real_bbox(c)
+    _insert_real_polygon(app, jid)
+    r = c.post(f"/jobs/{jid}/export")
+    assert r.status_code == 200
+    gpkg_path = Path(r.json()["gpkg_path"])
+    assert gpkg_path.exists()
+    detail = c.get(f"/jobs/{jid}").json()
+    assert detail["status"] == "EXPORTED"
+    assert detail["exported_revision"] == detail["validation_revision"]
+    assert detail["export_stale"] is False
+
+def test_export_rejects_pending_job(client):
+    c, _ = client
+    jid = c.post("/jobs", json={"prompt": "b", "bbox_wgs84": _munich_bbox()}).json()["id"]
+    r = c.post(f"/jobs/{jid}/export")
+    assert r.status_code == 409
+
+def test_re_export_from_exported_status_allowed(client, tmp_path):
+    c, app = client
+    jid = _post_real_bbox(c)
+    _insert_real_polygon(app, jid)
+    c.post(f"/jobs/{jid}/export")
+    r2 = c.post(f"/jobs/{jid}/export")
+    assert r2.status_code == 200
+
+def test_export_cleans_dop_directory(client, tmp_path):
+    c, app = client
+    jid = _post_real_bbox(c)
+    dop_dir = app.state.data_root / "dop" / jid
+    dop_dir.mkdir(parents=True)
+    (dop_dir / "chunk_0_0.tif").write_bytes(b"junk")
+    _insert_real_polygon(app, jid)
+    c.post(f"/jobs/{jid}/export")
+    assert not dop_dir.exists()
+
+def test_export_lock_serializes_parallel_calls(client):
+    """Two concurrent POSTs must both succeed and never crash."""
+    c, app = client
+    jid = _post_real_bbox(c)
+    _insert_real_polygon(app, jid)
+    results = []
+    def go():
+        results.append(c.post(f"/jobs/{jid}/export").status_code)
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    assert sorted(results) == [200, 200]
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/app/test_routes_jobs.py -v`
+Expected: new tests FAIL.
+
+- [ ] **Step 3: Append implementation**
+
+```python
+# ki_geodaten/app/routes/jobs.py (append)
+import shutil
+from shapely.geometry import box as shp_box
+from shapely.wkb import loads as wkb_loads
+import geopandas as gpd
+from ki_geodaten.jobs.store import (
+    get_polygons_for_job, get_nodata_for_job, update_status,
+)
+from ki_geodaten.pipeline.exporter import export_two_layer_gpkg
+from ki_geodaten.models import JobStatus, ErrorReason
+
+_EXPORTABLE = {"READY_FOR_REVIEW", "EXPORTED"}
+
+def _detected_gdf(rows: list[dict]) -> gpd.GeoDataFrame:
+    accepted = [r for r in rows if r["validation"] == "ACCEPTED"]
+    if not accepted:
+        return gpd.GeoDataFrame(
+            {"score": [], "source_tile_row": [], "source_tile_col": []},
+            geometry=[], crs="EPSG:25832",
+        )
+    geoms = [wkb_loads(r["geometry_wkb"]) for r in accepted]
+    return gpd.GeoDataFrame(
+        {
+            "score": [r["score"] for r in accepted],
+            "source_tile_row": [r["source_tile_row"] for r in accepted],
+            "source_tile_col": [r["source_tile_col"] for r in accepted],
+        },
+        geometry=geoms, crs="EPSG:25832",
+    )
+
+def _nodata_gdf(rows: list[dict]) -> gpd.GeoDataFrame:
+    if not rows:
+        return gpd.GeoDataFrame({"reason": []}, geometry=[], crs="EPSG:25832")
+    geoms = [wkb_loads(r["geometry_wkb"]) for r in rows]
+    return gpd.GeoDataFrame(
+        {"reason": [r["reason"] for r in rows]},
+        geometry=geoms, crs="EPSG:25832",
+    )
+
+# NOTE: `def` (not `async def`) — FastAPI runs this in its threadpool, so the
+# blocking GDAL/Fiona write below doesn't freeze the event loop. The
+# threading.Lock then correctly serializes concurrent workers.
+@router.post("/jobs/{job_id}/export")
+def export_job(job_id: str, request: Request):
+    db = request.app.state.db_path
+    job = get_job(db, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in _EXPORTABLE:
+        raise HTTPException(409, f"job status {job['status']!s} not exportable")
+
+    aoi = shp_box(*json.loads(job["bbox_utm_snapped"]))
+    out_path = request.app.state.results_dir / f"{job_id}.gpkg"
+
+    lock = request.app.state.export_lock
+    with lock:
+        polys = get_polygons_for_job(db, job_id)
+        nods = get_nodata_for_job(db, job_id)
+        det_gdf = _detected_gdf(polys)
+        nod_gdf = _nodata_gdf(nods)
+        try:
+            export_two_layer_gpkg(det_gdf, nod_gdf, aoi, out_path)
+        except Exception as exc:
+            update_status(
+                db, job_id, JobStatus.FAILED,
+                error_reason=str(ErrorReason.EXPORT_ERROR),
+                error_message=str(exc), set_finished=True,
+            )
+            raise HTTPException(500, f"export failed: {exc}") from exc
+
+        update_status(
+            db, job_id, JobStatus.EXPORTED,
+            gpkg_path=str(out_path),
+            exported_revision=int(job["validation_revision"]),
+        )
+
+    # Disk-Hygiene after successful export (Spec §7)
+    shutil.rmtree(request.app.state.data_root / "dop" / job_id, ignore_errors=True)
+    return {"gpkg_path": str(out_path)}
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/app/test_routes_jobs.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/app/routes/jobs.py tests/app/test_routes_jobs.py
+git commit -m "feat(api): export endpoint with lock, exported_revision, chunk cleanup"
+```
+
+---
+
+## Task 26: `GET /jobs/{id}/polygons` & `GET /jobs/{id}/nodata` with ProcessPoolExecutor + Cache
+
+**Files:**
+- Create: `ki_geodaten/app/routes/geojson.py`
+- Test: `tests/app/test_routes_geojson.py`
+
+**See Spec §8** — runs WKB→GeoJSON in `app.state.geojson_executor`, key cache by `(job_id, validation_revision, target)`.
+
+Because `ProcessPoolExecutor` submits picklable callables, the function invoked in the pool must be a module-level function that takes plain Python data (already in `ki_geodaten/app/serialization.py`).
+
+- [ ] **Step 1: Write failing test**
+
+```python
+# tests/app/test_routes_geojson.py
+import pytest
+from fastapi.testclient import TestClient
+from shapely.geometry import Polygon
+from shapely.wkb import dumps as wkb_dumps
+
+from ki_geodaten.app.main import create_app
+from ki_geodaten.jobs.store import insert_polygons, insert_nodata_region, update_status
+from ki_geodaten.models import JobStatus
+
+@pytest.fixture
+def client(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    monkeypatch.chdir(tmp_path)
+    # ThreadPoolExecutor avoids subprocess spawn; functools.partial in the
+    # route still works because it's picklable, but for threads it's just a
+    # callable — either way, the same route code is exercised.
+    app = create_app(
+        executor_factory=lambda: ThreadPoolExecutor(max_workers=2),
+        token_counter=lambda s: len(s.split()),
+    )
+    with TestClient(app) as c:
+        yield c, app
+
+def _setup(app, c):
+    jid = c.post("/jobs", json={
+        "prompt": "b", "bbox_wgs84": [11.55, 48.13, 11.56, 48.14],
+    }).json()["id"]
+    poly = Polygon([(691100, 5335100), (691200, 5335100),
+                    (691200, 5335200), (691100, 5335200)])
+    insert_polygons(app.state.db_path, jid, [
+        {"geometry_wkb": wkb_dumps(poly), "score": 0.9,
+         "source_tile_row": 0, "source_tile_col": 0}
+    ])
+    update_status(app.state.db_path, jid, JobStatus.READY_FOR_REVIEW,
+                  set_finished=True)
+    return jid, poly
+
+def test_get_polygons_returns_feature_collection(client):
+    c, app = client
+    jid, _ = _setup(app, c)
+    r = c.get(f"/jobs/{jid}/polygons")
+    assert r.status_code == 200
+    fc = r.json()
+    assert fc["type"] == "FeatureCollection"
+    assert len(fc["features"]) == 1
+    props = fc["features"][0]["properties"]
+    assert {"id", "score", "validation"}.issubset(props.keys())
+
+def test_get_nodata_returns_feature_collection(client):
+    c, app = client
+    jid, poly = _setup(app, c)
+    insert_nodata_region(
+        app.state.db_path, jid,
+        geometry_wkb=wkb_dumps(poly), tile_row=0, tile_col=0, reason="OOM",
+    )
+    r = c.get(f"/jobs/{jid}/nodata")
+    fc = r.json()
+    assert fc["features"][0]["properties"] == {"reason": "OOM"}
+
+def test_polygons_cache_invalidated_on_validate_bulk(client):
+    c, app = client
+    jid, _ = _setup(app, c)
+    fc1 = c.get(f"/jobs/{jid}/polygons").json()
+    assert fc1["features"][0]["properties"]["validation"] == "ACCEPTED"
+    c.post(
+        f"/jobs/{jid}/polygons/validate_bulk",
+        json={"updates": [{"pid": 1, "validation": "REJECTED"}]},
+    )
+    fc2 = c.get(f"/jobs/{jid}/polygons").json()
+    assert fc2["features"][0]["properties"]["validation"] == "REJECTED"
+
+def test_get_polygons_404(client):
+    c, _ = client
+    r = c.get("/jobs/nope/polygons")
+    assert r.status_code == 404
+```
+
+- [ ] **Step 2: Run to confirm failure**
+
+Run: `pytest tests/app/test_routes_geojson.py -v`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement**
+
+```python
+# ki_geodaten/app/routes/geojson.py
+from __future__ import annotations
+import asyncio
+import functools
+import json
+from fastapi import APIRouter, HTTPException, Request
+
+from ki_geodaten.app.serialization import (
+    build_polygons_feature_collection, build_nodata_feature_collection,
+)
+from ki_geodaten.jobs.store import (
+    get_job, get_polygons_for_job, get_nodata_for_job,
+)
+
+router = APIRouter()
+
+async def _run_in_executor(app, fn, /, *args, **kwargs):
+    """Submit to the dedicated GeoJSON executor.
+
+    We use functools.partial, NOT a lambda: ProcessPoolExecutor pickles the
+    callable when dispatching to a worker process; lambdas are not picklable
+    and would raise PicklingError at runtime. functools.partial of a
+    module-level function with picklable args IS picklable.
+    """
+    loop = asyncio.get_running_loop()
+    bound = functools.partial(fn, *args, **kwargs)
+    return await loop.run_in_executor(app.state.geojson_executor, bound)
+
+def _aoi(job: dict) -> tuple[float, float, float, float]:
+    return tuple(json.loads(job["bbox_utm_snapped"]))
+
+@router.get("/jobs/{job_id}/polygons")
+async def get_polygons(job_id: str, request: Request):
+    job = get_job(request.app.state.db_path, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    revision = int(job["validation_revision"] or 0)
+    key = (job_id, revision, "polygons")
+    cache = request.app.state.geojson_cache
+    if key in cache:
+        return cache[key]
+    rows = get_polygons_for_job(request.app.state.db_path, job_id)
+    fc = await _run_in_executor(
+        request.app, build_polygons_feature_collection,
+        rows, aoi_utm=_aoi(job),
+    )
+    cache[key] = fc
+    return fc
+
+@router.get("/jobs/{job_id}/nodata")
+async def get_nodata(job_id: str, request: Request):
+    job = get_job(request.app.state.db_path, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    revision = int(job["validation_revision"] or 0)
+    key = (job_id, revision, "nodata")
+    cache = request.app.state.geojson_cache
+    if key in cache:
+        return cache[key]
+    rows = get_nodata_for_job(request.app.state.db_path, job_id)
+    fc = await _run_in_executor(
+        request.app, build_nodata_feature_collection,
+        rows, aoi_utm=_aoi(job),
+    )
+    cache[key] = fc
+    return fc
+```
+
+- [ ] **Step 4: Run tests**
+
+Run: `pytest tests/app/test_routes_geojson.py -v`
+Expected: all PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/app/routes/geojson.py tests/app/test_routes_geojson.py
+git commit -m "feat(api): /polygons and /nodata via ProcessPoolExecutor with revision cache"
+```
+
+---
+
+## Task 27: Leaflet HTML Template + Static Assets
+
+**Files:**
+- Modify: `ki_geodaten/app/templates/index.html`
+- Create: `ki_geodaten/app/static/app.js`
+- Create: `ki_geodaten/app/static/app.css`
+
+**See Spec §9** — single page: map + prompt panel + job history. Leaflet forced `renderer: L.canvas()`; preset dropdown with tooltip. NoData overlay is hatched.
+
+Because this is client code driving a user-facing UI, there is no unit test layer; Task 30 (end-to-end) verifies the round-trip.
+
+- [ ] **Step 1: Rewrite `index.html`**
+
+```html
+<!-- ki_geodaten/app/templates/index.html -->
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Text-to-Polygon Pipeline</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <div id="sidebar">
+    <h1>ki-geodaten</h1>
+    <section id="prompt-panel">
+      <label>Prompt
+        <input id="prompt" type="text" placeholder="e.g. building">
+      </label>
+      <label>Tile preset
+        <select id="preset" title="small=64m | medium=128m | large=192m max object diameter">
+          <option value="small">small (solar, car, tree)</option>
+          <option value="medium" selected>medium (building, school)</option>
+          <option value="large">large (hall, stadium — slow)</option>
+        </select>
+      </label>
+      <button id="submit" disabled>Draw BBox &amp; Start</button>
+      <div id="status"></div>
+    </section>
+    <section id="job-history">
+      <h2>Jobs</h2>
+      <ul id="job-list"></ul>
+    </section>
+    <section id="review-panel" hidden>
+      <h2>Review</h2>
+      <p id="review-meta"></p>
+      <button id="export-btn">Export GPKG</button>
+      <a id="download-link" hidden>Download</a>
+    </section>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>
+```
+
+- [ ] **Step 2: Create `app.css`**
+
+```css
+/* ki_geodaten/app/static/app.css
+   NOTE: Polygon/NoData styling happens via Leaflet style options in app.js
+   (color / fillColor / dashArray / fillOpacity). The canvas renderer ignores
+   per-feature CSS classes, so we don't define .polygon-* classes here. */
+html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+body { display: flex; }
+#sidebar { width: 320px; padding: 12px; overflow-y: auto; border-right: 1px solid #ddd; }
+#map { flex: 1; height: 100vh; }
+label { display: block; margin: 8px 0; }
+input, select, button { width: 100%; padding: 6px; box-sizing: border-box; }
+#job-list { list-style: none; padding: 0; }
+#job-list li { padding: 6px; border-bottom: 1px solid #eee; cursor: pointer; }
+.badge { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 11px; color: #fff; }
+.badge-PENDING, .badge-DOWNLOADING, .badge-INFERRING { background: #888; }
+.badge-READY_FOR_REVIEW { background: #3a7; }
+.badge-EXPORTED { background: #36c; }
+.badge-FAILED { background: #c33; }
+```
+
+- [ ] **Step 3: Create `app.js`**
+
+```javascript
+// ki_geodaten/app/static/app.js
+(() => {
+  // Leaflet style constants — applied via native style() options, because
+  // Canvas-Renderer ignores CSS classes per feature (Spec §9.1).
+  const STYLE_ACCEPTED = { color: '#36c', fillColor: '#36c', fillOpacity: 0.2, weight: 1 };
+  const STYLE_REJECTED = { color: '#c33', fillColor: '#c33', fillOpacity: 0.15, weight: 1, dashArray: '4,2' };
+  const STYLE_NODATA   = { color: '#c93', fillColor: '#c93', fillOpacity: 0.25, weight: 1, dashArray: '6,3' };
+
+  const map = L.map('map', { renderer: L.canvas() }).setView([48.13, 11.56], 13);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '© OpenStreetMap',
+  }).addTo(map);
+
+  const drawnItems = new L.FeatureGroup().addTo(map);
+  const drawControl = new L.Control.Draw({
+    draw: {
+      rectangle: { shapeOptions: { color: '#36c' } },
+      polygon: false, polyline: false, circle: false, marker: false, circlemarker: false,
+    },
+    edit: { featureGroup: drawnItems, edit: false, remove: true },
+  });
+  map.addControl(drawControl);
+
+  const submitBtn = document.getElementById('submit');
+  const promptInput = document.getElementById('prompt');
+  const presetSelect = document.getElementById('preset');
+  const statusDiv = document.getElementById('status');
+  const jobList = document.getElementById('job-list');
+  const reviewPanel = document.getElementById('review-panel');
+  const reviewMeta = document.getElementById('review-meta');
+  const exportBtn = document.getElementById('export-btn');
+  const downloadLink = document.getElementById('download-link');
+
+  let currentBBox = null;
+  let currentJobId = null;
+  let currentLayer = null;
+  let nodataLayer = null;
+  let pollTimer = null;
+
+  // ── Validation debouncing state (declared before openJob because openJob uses it) ──
+  const pendingUpdates = new Map();
+  let flushTimer = null;
+  const MAX_CLIENT_BUFFER_UPDATES = 100;
+
+  const storageKey = id => `job:${id}:pending-validations`;
+  const snapshotUpdates = () =>
+    [...pendingUpdates].map(([pid, validation]) => ({pid, validation}));
+  function persistPending(jobId) {
+    if (!jobId) return;
+    sessionStorage.setItem(storageKey(jobId), JSON.stringify(snapshotUpdates()));
+  }
+  const clearPendingFromStorage = id => sessionStorage.removeItem(storageKey(id));
+  function hydratePending(id) {
+    const raw = sessionStorage.getItem(storageKey(id));
+    if (!raw) return;
+    try {
+      for (const {pid, validation} of JSON.parse(raw)) pendingUpdates.set(pid, validation);
+    } catch (e) {}
+  }
+
+  map.on(L.Draw.Event.CREATED, (e) => {
+    drawnItems.clearLayers();
+    drawnItems.addLayer(e.layer);
+    const b = e.layer.getBounds();
+    currentBBox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+    submitBtn.disabled = false;
+  });
+
+  map.on(L.Draw.Event.DELETED, () => { currentBBox = null; submitBtn.disabled = true; });
+
+  async function submit() {
+    const body = {
+      prompt: promptInput.value.trim(),
+      bbox_wgs84: currentBBox,
+      tile_preset: presetSelect.value,
+    };
+    const r = await fetch('/jobs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      statusDiv.textContent = 'Error: ' + (err.detail || r.statusText);
+      return;
+    }
+    const { id } = await r.json();
+    await refreshJobList();
+    openJob(id);
+  }
+  submitBtn.onclick = submit;
+
+  async function refreshJobList() {
+    const r = await fetch('/jobs');
+    const jobs = await r.json();
+    jobList.innerHTML = '';
+    for (const j of jobs) {
+      const li = document.createElement('li');
+      li.innerHTML = `<span class="badge badge-${j.status}">${j.status}</span> ${j.prompt}
+                     <small>${(j.tile_completed||0)}/${j.tile_total||'?'}</small>`;
+      li.onclick = () => openJob(j.id);
+      jobList.appendChild(li);
+    }
+  }
+
+  function stopPolling() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  }
+
+  async function openJob(id) {
+    stopPolling();
+    // Spec §9.2: flush to the OLD job BEFORE we switch currentJobId, otherwise
+    // leftover pending updates would be POSTed to the wrong job.
+    if (currentJobId && currentJobId !== id) {
+      await flushValidations();
+    }
+    pendingUpdates.clear();
+    currentJobId = id;
+    // Recover any batch that was stranded in sessionStorage (e.g. previous tab close).
+    hydratePending(id);
+    if (pendingUpdates.size) {
+      void flushValidations();
+    }
+
+    const r = await fetch(`/jobs/${id}`);
+    if (!r.ok) { statusDiv.textContent = 'Job not found'; return; }
+    const job = await r.json();
+    renderStatus(job);
+
+    if (['PENDING', 'DOWNLOADING', 'INFERRING'].includes(job.status)) {
+      pollTimer = setInterval(async () => {
+        const rr = await fetch(`/jobs/${id}`);
+        const jj = await rr.json();
+        renderStatus(jj);
+        if (!['PENDING', 'DOWNLOADING', 'INFERRING'].includes(jj.status)) {
+          stopPolling();
+          if (jj.status !== 'FAILED') loadPolygons(id);
+        }
+        refreshJobList();
+      }, 3000);
+    } else if (['READY_FOR_REVIEW', 'EXPORTED'].includes(job.status)) {
+      loadPolygons(id);
+    }
+  }
+
+  function renderStatus(job) {
+    statusDiv.innerHTML =
+      `<b>${job.status}</b> &mdash; ${job.tile_completed||0}/${job.tile_total||'?'}` +
+      (job.error_reason ? ` <em>(${job.error_reason})</em>` : '');
+    reviewPanel.hidden = !['READY_FOR_REVIEW', 'EXPORTED'].includes(job.status);
+    if (!reviewPanel.hidden) {
+      const stale = job.export_stale ? ' <strong>(export stale — re-export)</strong>' : '';
+      reviewMeta.innerHTML =
+        `validation rev ${job.validation_revision}, exported rev ${job.exported_revision ?? '—'}${stale}`;
+      downloadLink.hidden = !['EXPORTED'].includes(job.status) || job.export_stale;
+      downloadLink.href = `/jobs/${job.id}/export.gpkg`;
+      downloadLink.textContent = 'Download GPKG';
+    }
+  }
+
+  function featureStyle(f) {
+    return f.properties.validation === 'ACCEPTED' ? STYLE_ACCEPTED : STYLE_REJECTED;
+  }
+
+  async function loadPolygons(id) {
+    if (currentLayer) { map.removeLayer(currentLayer); currentLayer = null; }
+    if (nodataLayer) { map.removeLayer(nodataLayer); nodataLayer = null; }
+    const [polys, nods] = await Promise.all([
+      fetch(`/jobs/${id}/polygons`).then(r => r.json()),
+      fetch(`/jobs/${id}/nodata`).then(r => r.json()),
+    ]);
+    currentLayer = L.geoJSON(polys, {
+      style: featureStyle,
+      onEachFeature: (f, layer) => {
+        layer.on('click', () => toggleValidation(f, layer));
+      },
+    }).addTo(map);
+    nodataLayer = L.geoJSON(nods, {
+      style: () => STYLE_NODATA,
+    }).addTo(map);
+    if (polys.features.length) {
+      try { map.fitBounds(currentLayer.getBounds()); } catch (e) {}
+    }
+  }
+
+  function toggleValidation(feature, layer) {
+    feature.properties.validation =
+      feature.properties.validation === 'ACCEPTED' ? 'REJECTED' : 'ACCEPTED';
+    layer.setStyle(featureStyle(feature));
+    queueValidation(feature.properties.id, feature.properties.validation);
+  }
+
+  function queueValidation(pid, validation) {
+    if (!currentJobId) return;
+    pendingUpdates.set(pid, validation);
+    persistPending(currentJobId);
+    if (pendingUpdates.size >= MAX_CLIENT_BUFFER_UPDATES) {
+      void flushValidations();
+      return;
+    }
+    if (flushTimer) clearTimeout(flushTimer);
+    flushTimer = setTimeout(() => void flushValidations(), 3000);
+  }
+
+  async function flushValidations() {
+    if (!pendingUpdates.size || !currentJobId) return;
+    const jobId = currentJobId;
+    // Snapshot BUT keep pending in memory until the POST succeeds — otherwise
+    // a network error silently loses the user's validations (Spec §9.2).
+    const snapshot = new Map(pendingUpdates);
+    const updates = [...snapshot].map(([pid, validation]) => ({pid, validation}));
+    try {
+      const r = await fetch(`/jobs/${jobId}/polygons/validate_bulk`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({updates}),
+      });
+      if (!r.ok) throw new Error(`server ${r.status}`);
+      // Remove only the entries we just sent; new clicks during the POST stay.
+      for (const [pid, sentVal] of snapshot) {
+        if (pendingUpdates.get(pid) === sentVal) {
+          pendingUpdates.delete(pid);
+        }
+      }
+      if (pendingUpdates.size === 0) {
+        clearPendingFromStorage(jobId);
+      } else {
+        persistPending(jobId);
+      }
+    } catch (e) {
+      // Network / server error: leave pending intact for next retry.
+      // Re-persist so the current snapshot is durable across refresh.
+      persistPending(jobId);
+    }
+  }
+
+  window.addEventListener('pagehide', () => {
+    if (!pendingUpdates.size || !currentJobId) return;
+    persistPending(currentJobId);   // Durable recovery path.
+    const blob = new Blob(
+      [JSON.stringify({updates: snapshotUpdates().slice(0, MAX_CLIENT_BUFFER_UPDATES)})],
+      {type: 'application/json'},
+    );
+    navigator.sendBeacon(`/jobs/${currentJobId}/polygons/validate_bulk`, blob);
+  });
+
+  exportBtn.onclick = async () => {
+    if (!currentJobId) return;
+    await flushValidations();
+    const r = await fetch(`/jobs/${currentJobId}/export`, {method: 'POST'});
+    if (r.ok) openJob(currentJobId);
+    else statusDiv.textContent = 'Export failed';
+  };
+
+  refreshJobList();
+})();
+```
+
+- [ ] **Step 4: Smoke-test manually**
+
+Run: `uvicorn ki_geodaten.app.main:app --reload --reload-dir ki_geodaten --reload-exclude 'data/*' --reload-exclude '*.db*'`
+Open `http://127.0.0.1:8000/` in a browser. Verify: map loads, rectangle draw enables submit, invalid region (Berlin) yields an error banner.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/app/templates/index.html ki_geodaten/app/static/app.js ki_geodaten/app/static/app.css
+git commit -m "feat(ui): Leaflet map, draw, preset dropdown, validation debounce"
+```
+
+---
+
+## Task 28: Run Scripts (`scripts/run-server.sh`, `scripts/run-worker.sh`)
+
+**Files:**
+- Create: `scripts/run-server.sh`
+- Create: `scripts/run-worker.sh`
+- Test: manual (no unit tests — bash wrappers)
+
+**See Spec §12** — uvicorn needs `--reload-exclude` for SQLite WAL files. Worker supervisor loops until manual kill.
+
+- [ ] **Step 1: Write `scripts/run-server.sh`**
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+exec uvicorn ki_geodaten.app.main:app \
+    --host 127.0.0.1 --port 8000 \
+    --reload \
+    --reload-dir ki_geodaten \
+    --reload-exclude 'data/*' \
+    --reload-exclude '*.db*'
+```
+
+Make executable: `chmod +x scripts/run-server.sh` (Windows users run `python -m uvicorn …` directly; note in README).
+
+- [ ] **Step 2: Write `scripts/run-worker.sh`**
+
+```bash
+#!/usr/bin/env bash
+# Supervisor loop — on clean exit (after MAX_JOBS_PER_WORKER) or crash, respawn.
+# Spec §10: flushes VRAM fragmentation by killing and re-loading the python process.
+set -u
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# Make a single Ctrl-C stop the supervisor cleanly instead of respawning.
+trap 'echo "[supervisor] stopping"; exit 0' INT TERM
+
+while true; do
+    python -m ki_geodaten.worker.loop
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "[supervisor] worker exited rc=$rc, restarting in 2s"
+    else
+        echo "[supervisor] worker exited cleanly, restarting in 2s"
+    fi
+    sleep 2
+done
+```
+
+`chmod +x scripts/run-worker.sh`.
+
+- [ ] **Step 3: Verify shell syntax**
+
+Run: `bash -n scripts/run-server.sh && bash -n scripts/run-worker.sh`
+Expected: no output (syntax OK).
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add scripts/
+git commit -m "chore: add run-server.sh and run-worker.sh supervisor scripts"
+```
+
+---
+
+## Task 29: End-to-End Integration Test
+
+**Files:**
+- Create: `tests/test_end_to_end.py`
+
+**See Spec §11 End-to-End** — mini GeoTIFF fixture, mock WCS, stub segmenter returning fixed mask; verify the pipeline runs POST→WORKER→EXPORT and produces a valid two-layer GPKG.
+
+This test exercises the full worker + API together, using monkeypatches to replace the real segmenter and WCS.
+
+- [ ] **Step 1: Write test**
+
+```python
+# tests/test_end_to_end.py
+import json
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+# End-to-end needs osgeo.gdal.BuildVRT; skip cleanly when not installed.
+pytest.importorskip("osgeo")
+# fiona is optional for the assertion about layer listing.
+fiona = pytest.importorskip("fiona")
+
+import rasterio
+from rasterio.transform import from_bounds
+from fastapi.testclient import TestClient
+
+from ki_geodaten.app.main import create_app
+from ki_geodaten.jobs.store import get_job
+from ki_geodaten.worker.loop import run_forever
+from ki_geodaten.pipeline.segmenter import MaskResult
+
+def _make_vrt(path: Path, bbox):
+    tif = path.parent / "chunk_0_0.tif"
+    w = round((bbox[2] - bbox[0]) / 0.2)
+    h = round((bbox[3] - bbox[1]) / 0.2)
+    with rasterio.open(
+        tif, "w", driver="GTiff", width=w, height=h, count=3,
+        dtype="uint8", crs="EPSG:25832", transform=from_bounds(*bbox, w, h),
+        nodata=0,
+    ) as dst:
+        arr = np.full((3, h, w), 128, dtype="uint8")
+        dst.write(arr)
+    from osgeo import gdal
+    gdal.BuildVRT(str(path), [str(tif)])
+
+class _StubSegmenter:
+    def predict(self, tile, prompt):
+        mask = np.zeros((tile.size, tile.size), dtype=bool)
+        mask[500:524, 500:524] = True  # 24×24 px = ~4.8×4.8 m
+        return [MaskResult(mask=mask, score=0.95, box_pixel=(500, 500, 524, 524))]
+    def encoder_token_count(self, s):
+        return len(s.split())
+
+def test_end_to_end(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    # Monkeypatch download_dop20 to synthesise a VRT on disk instead of HTTP
+    def fake_download(bbox_utm, preset_center_margin_px, out_dir, **kwargs):
+        out_dir.mkdir(parents=True, exist_ok=True)
+        vrt = out_dir / "out.vrt"
+        _make_vrt(vrt, bbox_utm)
+        return vrt
+    monkeypatch.setattr(
+        "ki_geodaten.worker.orchestrator.download_dop20", fake_download,
+    )
+
+    from concurrent.futures import ThreadPoolExecutor
+    app = create_app(
+        executor_factory=lambda: ThreadPoolExecutor(max_workers=2),
+        token_counter=lambda s: len(s.split()),
+    )
+    with TestClient(app) as client:
+        r = client.post(
+            "/jobs",
+            json={"prompt": "building", "bbox_wgs84": [11.55, 48.13, 11.56, 48.14]},
+        )
+        assert r.status_code == 200
+        jid = r.json()["id"]
+
+        # Run the worker inline (single job, exit quickly)
+        run_forever(
+            db_path=app.state.db_path, data_root=app.state.data_root,
+            segmenter_factory=_StubSegmenter,
+            wcs_url="", coverage_id="", max_pixels=4000,
+            origin_x=0.0, origin_y=0.0,
+            min_polygon_area_m2=0.01, safe_center_nodata_threshold=0.0,
+            max_jobs=1, poll_interval=0.01, idle_exit_after=1,
+        )
+
+        job = get_job(app.state.db_path, jid)
+        assert job["status"] == "READY_FOR_REVIEW"
+
+        # Polygons endpoint returns at least one feature
+        fc = client.get(f"/jobs/{jid}/polygons").json()
+        assert fc["type"] == "FeatureCollection"
+        assert len(fc["features"]) >= 1
+
+        # Export produces a valid GPKG with both layers
+        exp = client.post(f"/jobs/{jid}/export")
+        assert exp.status_code == 200
+        gpkg_path = Path(exp.json()["gpkg_path"])
+        assert gpkg_path.exists()
+        layers = fiona.listlayers(str(gpkg_path))
+        assert {"detected_objects", "nodata_regions"}.issubset(layers)
+
+        # Download works
+        dl = client.get(f"/jobs/{jid}/export.gpkg")
+        assert dl.status_code == 200
+        assert len(dl.content) > 0
+```
+
+- [ ] **Step 2: Run**
+
+Run: `pytest tests/test_end_to_end.py -v`
+Expected: PASS.
+
+If it fails due to GDAL availability of BuildVRT in the test environment, skip the test module at import time via `pytest.importorskip("osgeo")` and still commit.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/test_end_to_end.py
+git commit -m "test: end-to-end integration across API and worker"
+```
+
+---
+
+## Task 30: README
+
+**Files:**
+- Create: `README.md`
+
+Goal: document local setup, how to install `sam3` and `gdal` (the two non-pip deps), how to run server and worker, and how to point at a real LDBV WCS.
+
+- [ ] **Step 1: Write `README.md`**
+
+```markdown
+# Text-to-Polygon Pipeline (Bayern DOP20 + SAM 3.1)
+
+Local prototype that extracts georeferenced polygons from Bayerische DOP20
+orthophotos using a free-text prompt and SAM 3.1 zero-shot segmentation.
+
+See `docs/superpowers/specs/2026-04-22-text-to-polygon-design.md` for the
+full design rationale.
+
+## Requirements
+
+- Python 3.12
+- CUDA 12.6 + PyTorch 2.7 (RTX 4070 / 12 GB VRAM tested)
+- `gdal` (install via conda, not pip — needed for `BuildVRT`)
+- `sam3` from `facebookresearch/sam3` (install per upstream README)
+- SQLite 3.35+ (bundled with Python)
+
+## Install
+
+```bash
+conda create -n ki-geodaten python=3.12 gdal -c conda-forge
+conda activate ki-geodaten
+pip install -e .[dev]
+# then follow https://github.com/facebookresearch/sam3 to install sam3
+```
+
+Download the SAM 3.1 checkpoint into `models/sam3.1_hiera_large.pt`.
+
+## Configure
+
+Copy `.env.example` → `.env`, fill in verified values:
+
+```
+WCS_URL=https://geoservices.bayern.de/wcs/v2/dop20
+WCS_COVERAGE_ID=by_dop20rgb
+WCS_GRID_ORIGIN_X=<from GetCapabilities>
+WCS_GRID_ORIGIN_Y=<from GetCapabilities>
+```
+
+**Before first run:** verify WCS axis order, origin, and max pixel count via
+a manual `GetCapabilities` request (Spec §15).
+
+## Run
+
+Two processes in separate terminals:
+
+```bash
+./scripts/run-server.sh   # http://127.0.0.1:8000
+./scripts/run-worker.sh   # GPU worker + supervisor
+```
+
+On Windows, run these via `bash` (Git Bash / WSL) or invoke the commands
+directly:
+
+```powershell
+python -m uvicorn ki_geodaten.app.main:app --reload `
+    --reload-dir ki_geodaten --reload-exclude "data/*" --reload-exclude "*.db*"
+python -m ki_geodaten.worker.loop
+```
+
+## Tests
+
+```bash
+pytest
+```
+
+Tests do not require `sam3` or GPU; they stub the segmenter. The end-to-end
+test needs `gdal.BuildVRT`, which is provided by the conda-installed GDAL.
+
+## Known limits
+
+- Only Bayern (LDBV WCS-specific).
+- 1 km² max AOI (see Spec §9.1).
+- `tile_preset` selects max object diameter: 64 m / 128 m / 192 m.
+- Large preset is not interactive (~1 h per 1 km²).
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add README.md
+git commit -m "docs: add setup, run, and limits overview"
+```
+
+---
+
+## Self-Review Checklist (after implementation)
+
+Before marking the plan done, verify:
+
+**Spec invariants**
+- [ ] Every Spec section §5.1–§12 has at least one implementing task.
+- [ ] `validation_revision` is written ONLY by `validate_bulk`; never by export.
+- [ ] `exported_revision` is written ONLY by the export endpoint.
+- [ ] `nodata_regions.geometry_wkb` always stores the **safe-center** polygon (size-2·margin), never the full tile.
+- [ ] `bbox_utm_snapped` is the unexpanded user AOI; the download bbox is only used at download time.
+- [ ] GeoJSON responses and GPKG are both clipped to `bbox_utm_snapped` (Clip-Window-Semantik).
+- [ ] `masks_to_polygons` uses `connectivity=8` and excludes `value != 1`.
+- [ ] Worker never holds a write transaction longer than one tile.
+- [ ] Export route is wrapped by `app.state.export_lock`.
+- [ ] `validate_bulk` uses `executemany`, never variadic `VALUES(...)`.
+- [ ] GeoJSON precision ≤ 1e-6° (set via `shapely.set_precision`).
+- [ ] Bayern fence AND UTM-area check are both enforced in `POST /jobs`.
+- [ ] `run-server.sh` passes `--reload-exclude 'data/*' --reload-exclude '*.db*'`.
+- [ ] Worker startup hook both marks DOWNLOADING/INFERRING jobs as FAILED **and** rmtree's orphan `data/dop/*` directories.
+- [ ] Retention cleanup CASCADEs polygon/nodata deletion and removes `.gpkg` files.
+
+**Bugs found during plan review — must stay fixed**
+- [ ] `POST /jobs/{id}/export` is declared as `def` (not `async def`), so the blocking GDAL/Fiona call runs in FastAPI's threadpool and doesn't block the event loop.
+- [ ] `validate_bulk` counts via `cursor.rowcount` AFTER `executemany` — relies on Python ≥3.12 cumulative semantics; `pyproject.toml` enforces this.
+- [ ] Orchestrator catches `Exception` (NOT `BaseException`) around `segmenter.predict(...)` — `BaseException` would eat Ctrl-C / SystemExit.
+- [ ] Orchestrator iterates tiles lazily (`for tile in iter_tiles(...)`) and obtains `tile_total` via a cheap `iter_grid(src, cfg)` count — never materializes all tiles in memory.
+- [ ] Geojson route uses `functools.partial`, not a lambda, when submitting to `ProcessPoolExecutor` (lambdas are not picklable).
+- [ ] Export route unpickles via module-level `update_status` import (no in-function `from ... import ... as _us` shadowing).
+- [ ] `_job_view` returns `bbox_wgs84` as a parsed **array**, not a JSON string.
+- [ ] Frontend styles polygons via native Leaflet `style` options (color / fillColor / dashArray), NOT CSS classes — `L.canvas()` ignores per-feature className.
+- [ ] Frontend `openJob(id)` flushes to the PREVIOUS `currentJobId` before switching, then clears `pendingUpdates`, then calls `hydratePending(id)` so session-persisted updates are recovered.
+- [ ] Frontend `flushValidations()` only removes entries from `pendingUpdates` AFTER a successful POST; on network/server error the batch stays in memory and is re-persisted for retry.
+
+**Production hardening**
+- [ ] `app.state.token_counter` uses the **real SAM text tokenizer** loaded on CPU in production; the whitespace-split fallback logs a WARNING (never silent).
+- [ ] `create_app(executor_factory=..., token_counter=...)` accepts overrides so tests can inject a `ThreadPoolExecutor` and a deterministic token counter — production uses the defaults.
+- [ ] `scripts/run-worker.sh` traps SIGINT/SIGTERM so a single Ctrl-C stops the supervisor cleanly.
+- [ ] End-to-end test uses `pytest.importorskip("osgeo")` / `pytest.importorskip("fiona")` so the suite degrades gracefully when GDAL/Fiona aren't installed.
+
+**Spec note — must be resolved before implementation**
+- [ ] Margin-expansion semantics: plan follows §5.2 (CENTER_MARGIN_PX × 0.2 m = 32/64/96 m). §5.1 pt 4 quotes conflicting numbers (64/128/192 m). Confirm with spec author which value is authoritative before coding Task 7 — if the larger values are intended, double `CENTER_MARGIN_PX` and rebase Task 7 tests.
+
+If a checkbox fails, fix inline and re-run the relevant test.
