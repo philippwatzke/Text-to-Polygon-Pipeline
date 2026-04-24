@@ -34,7 +34,7 @@ Nicht-Ziele: kommerzielles SaaS, Echtzeit-Interaktion, Multi-User-Deployment, Sk
 - **NFR-4 (Kein Blocking):** Webserver blockiert nie auf GPU-Arbeit. Antwortzeit auf `POST /jobs` < 50 ms.
 - **NFR-5 (Crash-Resilienz):** Ein fehlgeschlagener Job oder Worker-Absturz blockiert die Queue nicht länger als einen Worker-Neustart (~10 s).
 - **NFR-6 (Disk-Hygiene):** Kein unbegrenztes Wachstum von Zwischendateien. DOP-Chunks werden nach erfolgreichem Export gelöscht; `nodata_regions` und `polygons` bleiben in SQLite **bis zur Retention-Grenze** (NFR-7).
-- **NFR-7 (DB-Retention):** `FAILED`- und `EXPORTED`-Jobs werden nach `RETENTION_DAYS = 7` vollständig gelöscht (inkl. Polygone, NoData-Regionen, GeoPackage-Datei). Ein täglicher Cleanup-Task im Worker (Leerlaufzeit oder beim Worker-Restart) führt `DELETE FROM jobs WHERE status IN ('FAILED','EXPORTED') AND finished_at < ?` aus (Polygone und NoData-Regionen verschwinden via `ON DELETE CASCADE`), löscht `data/results/{job_id}.gpkg`, und schließt mit `VACUUM`. Verhindert, dass `jobs.db` bei 1 000 Explorations-Läufen auf 10 GB anschwillt.
+- **NFR-7 (DB-Retention):** `FAILED`- und `EXPORTED`-Jobs werden nach `RETENTION_DAYS = 7` vollständig gelöscht (inkl. Polygone, NoData-Regionen, GeoPackage-Datei). Ein täglicher Cleanup-Task im Worker (Leerlaufzeit oder beim Worker-Restart) selektiert alte Jobs, löscht sie in Batches von maximal 900 IDs (`ON DELETE CASCADE` entfernt Polygone und NoData-Regionen), löscht `data/results/{job_id}.gpkg`, und schließt mit `VACUUM`. Das Batching vermeidet `SQLITE_MAX_VARIABLE_NUMBER`-Fehler bei vielen Explorations-Jobs.
 
 ## 4. Architektur-Überblick
 
@@ -143,7 +143,7 @@ Jede Stufe ist ein Modul in `pipeline/` mit klar typisierter Ein-/Ausgabe, isoli
 
 5. **Minimalgröße garantieren:** Nach Expansion prüft der Client, ob `(maxx - minx) < TILE_SIZE * 0.2 m = 204.8 m` oder analog in y. Falls ja, wird die BBox **symmetrisch weiter expandiert** auf exakt 204.8 m (ebenfalls grid-aligned). So ist garantiert, dass das resultierende VRT mindestens 1024 × 1024 px groß ist und `tiler.iter_tiles()` nicht auf Out-of-Bounds-Reads läuft.
 
-6. **Pixel-Dimensionen für WCS-Request:** Die `WIDTH`/`HEIGHT`-Parameter des WCS-`GetCoverage`-Calls werden aus der BBox berechnet. **Achtung Fließkomma-Falle:** `int((maxx_s - minx_s) / 0.2)` kann wegen IEEE-754-Ungenauigkeiten 1499 statt 1500 ergeben (z. B. `300.0 / 0.2 == 1499.9999999999998`). Der Server würde dann 300 m in 1499 px interpolieren — das macht das Grid-Snapping zunichte. Lösung: **zwingend `round()` statt `int()`**, oder noch robuster via `Decimal`:
+6. **Pixel-Dimensionen für WCS-Request:** Die Pixelzahl des WCS-`GetCoverage`-Calls wird über den WCS-2.0-Scaling-Parameter aus der BBox berechnet (`ScaleSize` nach OGC 12-039, falls Task 0 keinen LDBV-spezifischen alternativen Parameternamen verifiziert). **Achtung Fließkomma-Falle:** `int((maxx_s - minx_s) / 0.2)` kann wegen IEEE-754-Ungenauigkeiten 1499 statt 1500 ergeben (z. B. `300.0 / 0.2 == 1499.9999999999998`). Der Server würde dann 300 m in 1499 px interpolieren — das macht das Grid-Snapping zunichte. Lösung: **zwingend `round()` statt `int()`**, oder noch robuster via `Decimal`:
     ```python
     width_px = round((maxx_s - minx_s) / 0.2)
     # oder: int((Decimal(str(maxx_s)) - Decimal(str(minx_s))) / Decimal("0.2"))
@@ -254,7 +254,7 @@ if safe.mean() > SAFE_CENTER_NODATA_THRESHOLD:   # für NFR-2 praktisch 0.0
 
 NoData **außerhalb** des Safe-Zentrums ist tolerierbar: Der Center-Keep-Filter verwirft Halluzinationen aus diesen Randbereichen ohnehin. NoData **innerhalb** des Safe-Zentrums darf dagegen nie still weiterlaufen, weil sonst Objekte mit Mittelpunkt in der exklusiven Verantwortungszone unbemerkt verloren gehen könnten.
 
-RGB-Schwarz `(0,0,0)` darf nur als **sekundärer Fallback** verwendet werden, wenn beim echten WCS-Output explizit verifiziert wurde, dass schwarze Pixel tatsächlich NoData kodieren und nicht legitime Bildinhalte sein können. Dieser Fallback ist im Spec **nicht Default**.
+RGB-Schwarz `(0,0,0)` darf **nicht** als NoData-Heuristik verwendet werden. Echte Schatten, Asphalt oder sehr dunkle Bildbereiche können legitime RGB-Nullwerte tragen; NoData kommt ausschließlich aus GDAL-Alpha/Masken-Bändern (`src.dataset_mask(...) == 0`).
 
 **Signatur:**
 ```python
@@ -273,16 +273,19 @@ def iter_tiles(vrt_path: Path, cfg: TileConfig) -> Iterator[Tile]:
 - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` als Env-Variable reduziert Fragmentierung.
 - **Prompt-Längenprüfung muss auf der finalen Encoder-Sequenz passieren:** Das API-Limit orientiert sich nicht am rohen User-String, sondern an der **tatsächlich an den Text-Encoder übergebenen Token-Sequenz** nach Anwendung des Modell-Templates und aller Spezialtokens. Der Webserver darf daher nicht nur „77 User-Tokens“ zählen, sondern muss denselben Encode-Pfad wie `Sam3Segmenter.predict()` bzw. dessen Text-Wrapper verwenden.
 - Per-Tile try/except um `predict()`: bei `torch.cuda.OutOfMemoryError` wird das **Safe-Zentrum** der Kachel als `nodata_regions` (reason=`OOM`) markiert, der Loop fährt fort. Bei `Exception`: reason=`INFERENCE_ERROR` mit Traceback-Tail.
-- **Tile-lokale Masken-Deduplikation ist zwingend:** Die BBox-Center-Rule aus 5.4 löst nur Cross-Tile-Dopplungen. Innerhalb **einer** Kachel kann SAM für dasselbe Objekt mehrere stark überlappende Masken liefern. Deshalb werden die Rohmasken vor der Polygonisierung score-absteigend dedupliziert: Ein Kandidat wird verworfen, wenn er zu einer bereits behaltenen Maske entweder `mask_iou >= LOCAL_MASK_NMS_IOU` erreicht **oder** eine starke Verschachtelung aufweist (`intersection_area / min(area_a, area_b) >= LOCAL_MASK_CONTAINMENT_RATIO`). Damit verschwinden tile-interne Mehrfachdetektionen (z. B. Dach vs. Dach+Schatten) bevor sie als Polygone persistiert werden.
+- **Tile-lokale Masken-Deduplikation ist zwingend:** Die BBox-Center-Rule aus 5.4 löst nur Cross-Tile-Dopplungen. Innerhalb **einer** Kachel kann SAM für dasselbe Objekt mehrere stark überlappende Masken liefern. Deshalb werden die Rohmasken vor der Polygonisierung score-absteigend dedupliziert: Ein Kandidat wird verworfen, wenn er zu einer bereits behaltenen Maske entweder `mask_iou >= LOCAL_MASK_NMS_IOU` erreicht **oder** eine starke Verschachtelung aufweist (`intersection_area / min(area_a, area_b) >= LOCAL_MASK_CONTAINMENT_RATIO`). Vor jedem dichten Maskenvergleich muss ein billiger `box_pixel`-Overlap-Check laufen; disjunkte Bounding Boxes können keine Pixel-Intersection haben und dürfen nicht zu `np.logical_and()` über 1024×1024-Arrays führen. Damit verschwinden tile-interne Mehrfachdetektionen (z. B. Dach vs. Dach+Schatten) bevor sie als Polygone persistiert werden, ohne dass dicht bebaute Tiles im CPU-NMS kollabieren.
 - **Tensor-Scope-Cleanup pro Iteration:** `torch.cuda.empty_cache()` gibt nur unreferenzierten VRAM frei — Python-Referenzen blockieren die Freigabe. Die alte Kachel bleibt bis zur nächsten Schleifeniteration im Scope und überlagert die neue Allokation. Auf einer 12-GB-Karte kann das am Kachelwechsel zum Crash führen. Regel am Ende **jedes** Schleifendurchlaufs (normal **und** im except-Block):
    ```python
    # innerhalb der for-tile-Schleife nach dem Call
-   masks_cpu = [MaskResult(m.mask.cpu().numpy(), m.score, m.box_pixel) for m in gpu_masks]
+   masks_cpu = [
+       MaskResult(m.mask.detach().cpu().numpy().copy(), m.score, m.box_pixel)
+       for m in gpu_masks
+   ]
    del gpu_masks, tile   # Referenzen freigeben
    torch.cuda.empty_cache()
    yield masks_cpu
    ```
-   Alles, was nach dem Yield gebraucht wird (Masken, Scores, Boxes), wird vorher auf die CPU kopiert.
+   Alles, was nach dem Yield gebraucht wird (Masken, Scores, Boxes), wird vorher auf die CPU kopiert. Im `except`-Pfad muss zusätzlich der Exception-Kontext vor `empty_cache()` gebrochen werden (`exc.__traceback__ = exc.__context__ = exc.__cause__ = None; del exc`), weil Traceback-Frames sonst temporäre GPU-Tensoren aus dem fehlgeschlagenen SAM-Call referenzieren können.
 
 **Datenklasse & Signatur:**
 ```python
@@ -383,15 +386,22 @@ Zwei Layer im Output, beide in EPSG:25832:
 
 **Kritisch:** Die NoData-Geometrie ist das **Safe-Zentrum** (z. B. 384 × 384 px im medium-Preset), nicht der volle Tile-Footprint (1024 × 1024 px). Grund: Tiles überlappen um 640 px (medium); würde man den Full-Footprint als NoData markieren, exkludierte man damit Safe-Zentren der 8 Nachbar-Tiles, die dort erfolgreich segmentiert haben — ALKIS-Features in diesen Bereichen würden fälschlich aus der Evaluation fliegen und die Metriken künstlich verschlechtern. Das Safe-Zentrum ist der einzige Raumbereich, für den diese Kachel exklusiv verantwortlich war.
 
-Für die methodisch saubere P/R-Evaluation in QGIS gilt dieselbe AOI-Semantik wie für die Vorhersagen: Referenz-Features (z. B. ALKIS-Gebäude) werden zuerst auf dieselbe Nutzer-AOI geclippt und danach werden diejenigen Referenzteile exkludiert, die `nodata_regions` schneiden. So wird nicht ein ungeclipptes Referenzobjekt mit einem geclippten Vorhersageobjekt verglichen.
+Für die methodisch saubere P/R-Evaluation in QGIS gilt dieselbe AOI-Semantik wie für die Vorhersagen: Referenz-Features (z. B. ALKIS-Gebäude) werden zuerst auf dieselbe Nutzer-AOI geclippt und danach werden diejenigen Referenzteile exkludiert, die `nodata_regions` schneiden. So wird nicht ein ungeclipptes Referenzobjekt mit einem geclippten Vorhersageobjekt verglichen. **Wichtig:** Die exportierten/angezeigten Geometrien sind bewusst AOI-geclippt und dürfen nicht gegen ungeclippte ALKIS-Vollobjekte bewertet werden. Für eine spätere Full-Object-Metrik müsste ein separater, ungeclippter Exportpfad oder die interne SQLite-Geometrie verwendet werden.
 
 **AOI-Clip vor user-sichtbarer Ausgabe ist zwingend:** Weil 5.1 die Download-BBox absichtlich über die Nutzer-AOI hinaus expandiert, dürfen Export und UI diese Hilfszone **nicht** unverändert zurückgeben. Die AOI-Semantik des Produkts lautet dabei explizit: **Die Nutzer-BBox ist ein räumliches Clip-Window, kein Center-Ownership-Filter.** Ein Objekt wird also im Output berücksichtigt, wenn seine Geometrie die AOI schneidet; im Export und in GeoJSON erscheint dann nur der innerhalb der AOI liegende Geometrieteil. Vor GeoPackage-Export und vor den GeoJSON-Antworten werden `detected_gdf` und `nodata_gdf` deshalb räumlich auf `jobs.bbox_utm_snapped` reduziert. Für Polygone an der AOI-Kante wird die Geometrie mit der AOI geschnitten (`intersection(requested_bbox_polygon)`), leere Resultate werden verworfen. **Wichtig:** Der Clip kann aus einem einzelnen Polygon wieder ein `MultiPolygon` oder eine `GeometryCollection` machen. Deshalb läuft **nach dem AOI-Clip erneut** derselbe Polygon-Only-Normalisierungspfad wie in 5.4 (`make_valid` + `extract_polygons` + `explode`), bevor die Geometrien in Polygon-Layer oder GeoJSON serialisiert werden. Gleiches gilt für `nodata_regions`, damit weder Detections noch NoData außerhalb des angefragten Gebiets im Output erscheinen.
 
 **Re-Export nach Re-Validation:** Ein Nutzer kann nach dem ersten Export False Positives entdecken, sie auf REJECTED setzen und erneut exportieren. Fiona/GeoPandas-Verhalten bei existierenden `.gpkg`-Dateien ist uneinheitlich (Append in Duplikate **oder** `ValueError: Layer already exists`). Deshalb **zwingend** vor dem Schreiben:
 
 ```python
-out_path.unlink(missing_ok=True)   # alten Export löschen, GeoPandas schreibt frisch
+out_path.unlink(missing_ok=True)                    # Hauptdatenbank
+out_path.with_suffix(".gpkg-wal").unlink(missing_ok=True)  # SQLite WAL-Sidecar
+out_path.with_suffix(".gpkg-shm").unlink(missing_ok=True)  # SQLite SHM-Sidecar
 ```
+
+Ein GeoPackage ist eine SQLite-Datenbank. Bei Re-Exporten müssen deshalb die
+WAL/SHM-Sidecars zusammen mit der Hauptdatei entfernt werden; verwaiste
+Sidecars neben einer frisch angelegten `.gpkg`-Datei können den neuen Export
+beschädigen.
 
 **Leere Ergebnis-Layer sind ein First-Class-Fall:** Wenn ein Prompt keine Treffer liefert oder der Nutzer alles auf `REJECTED` setzt, ist `detected_gdf` leer. Das Export-Verhalten darf dann **nicht** vom impliziten Schema-Inferenzpfad von GeoPandas/Fiona abhängen. Der Exporter muss beide Layer mit **explizitem Schema** anlegen, auch bei `0` Features:
 
@@ -585,8 +595,17 @@ Alle Request/Response-Bodies sind JSON. Koordinaten-BBoxes einheitlich als `[min
 
 ```python
 from shapely import set_precision
+from shapely.validation import make_valid
+
 geom_4326 = set_precision(geom_4326, grid_size=1e-6)   # ~11 cm am Äquator
+geom_4326 = make_valid(geom_4326)                      # Precision kann Topologie ändern
+polys = extract_polygons(geom_4326)                    # Lines/Points nach Rundung verwerfen
 ```
+
+Die GeoJSON-Erzeugung läuft vollständig im dedizierten `ProcessPoolExecutor`,
+inklusive `json.dumps(...)`. Die FastAPI-Route gibt danach nur den fertigen
+JSON-String per `Response(media_type="application/json")` zurück. Dadurch
+blockiert nicht die Event-Loop beim Serialisieren großer FeatureCollections.
 
 Reduziert die Payload um 60–70 %, ohne Genauigkeit zu verlieren, die am Display jemals sichtbar wäre (1e-6° ≈ 11 cm bei Bayern-Breite).
 
@@ -618,6 +637,7 @@ Der Endpoint heißt bewusst `validate_bulk`, nicht per-Polygon. Grund: Schnelle 
 ```javascript
 const pendingUpdates = new Map();   // pid → validation
 let flushTimer = null;
+let isFlushing = false;
 const MAX_CLIENT_BUFFER_UPDATES = 100;
 const STORAGE_KEY = `job:${jobId}:pending-validations`;
 
@@ -644,6 +664,7 @@ function hydratePendingFromStorage() {
 function queueValidation(pid, validation) {
     pendingUpdates.set(pid, validation);
     persistPendingToStorage();
+    if (isFlushing) return;
     if (pendingUpdates.size >= MAX_CLIENT_BUFFER_UPDATES) {
         void flushValidations();
         return;
@@ -653,15 +674,32 @@ function queueValidation(pid, validation) {
 }
 
 async function flushValidations() {
-    if (!pendingUpdates.size) return;
-    const updates = snapshotUpdates();
-    pendingUpdates.clear();
-    await fetch(`/jobs/${jobId}/polygons/validate_bulk`, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({updates}),
-    });
-    clearPendingFromStorage();
+    if (isFlushing || !pendingUpdates.size) return;
+    isFlushing = true;
+    const snapshot = new Map(pendingUpdates);
+    const updates = [...snapshot].map(([pid, validation]) => ({pid, validation}));
+    let failed = false;
+    try {
+        const r = await fetch(`/jobs/${jobId}/polygons/validate_bulk`, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({updates}),
+        });
+        if (!r.ok) throw new Error(`server ${r.status}`);
+        for (const [pid, sentVal] of snapshot) {
+            if (pendingUpdates.get(pid) === sentVal) pendingUpdates.delete(pid);
+        }
+        pendingUpdates.size ? persistPendingToStorage() : clearPendingFromStorage();
+    } catch (e) {
+        failed = true;
+        persistPendingToStorage();
+    } finally {
+        isFlushing = false;
+        if (pendingUpdates.size) {
+            if (flushTimer) clearTimeout(flushTimer);
+            flushTimer = setTimeout(() => void flushValidations(), failed ? 3000 : 0);
+        }
+    }
 }
 
 hydratePendingFromStorage();
@@ -672,15 +710,18 @@ if (pendingUpdates.size) {
 window.addEventListener('pagehide', () => {
     if (!pendingUpdates.size) return;
     persistPendingToStorage();  // Recovery-Pfad, falls der Tab sofort weg ist
-    const blob = new Blob(
-        [JSON.stringify({updates: snapshotUpdates().slice(0, MAX_CLIENT_BUFFER_UPDATES)})],
-        {type: 'application/json'}
-    );
-    navigator.sendBeacon(`/jobs/${jobId}/polygons/validate_bulk`, blob);
+    fetch(`/jobs/${jobId}/polygons/validate_bulk`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+            updates: snapshotUpdates().slice(0, MAX_CLIENT_BUFFER_UPDATES),
+        }),
+        keepalive: true,
+    }).catch(() => {});
 });
 ```
 
-`pagehide`/`sendBeacon()` dient hier nur als Best-Effort für den **kleinen Restpuffer**. Der eigentliche Zuverlässigkeitsmechanismus ist: häufiges Debounce-Flush, harte Obergrenze `MAX_CLIENT_BUFFER_UPDATES`, und `sessionStorage`-Recovery beim nächsten Laden des Jobs. Große ungesendete Batches dürfen **nicht** erst beim Tab-Close entstehen. Der oft genannte „CORS/Preflight-Fallstrick“ greift in dieser Architektur **nicht**, weil UI und API same-origin vom selben FastAPI-Prozess ausgeliefert werden. Falls die UI später auf eine andere Origin ausgelagert wird, darf der Beacon-Pfad nicht unverändert übernommen werden; dann ist entweder ein same-origin Proxy oder ein anderer Close-Path nötig.
+`pagehide`/`fetch(..., keepalive: true)` dient hier nur als Best-Effort für den **kleinen Restpuffer**. Der eigentliche Zuverlässigkeitsmechanismus ist: häufiges Debounce-Flush, harte Obergrenze `MAX_CLIENT_BUFFER_UPDATES`, und `sessionStorage`-Recovery beim nächsten Laden des Jobs. Große ungesendete Batches dürfen **nicht** erst beim Tab-Close entstehen. `sendBeacon()` wird bewusst nicht genutzt, weil JSON-Beacons je nach Browser/Origin-Setup an Content-Type- und Preflight-Regeln scheitern können. `keepalive` hat Payload-Limits; deshalb bleibt der Restpuffer hart begrenzt.
 
 ## 10. Fehlerbehandlung
 
@@ -732,6 +773,7 @@ WCS_GRID_ORIGIN_X: float  = 0.0   # nach GetCapabilities verifizieren
 WCS_GRID_ORIGIN_Y: float  = 0.0   # nach GetCapabilities verifizieren
 WCS_SUBSET_AXIS_X: str    = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
 WCS_SUBSET_AXIS_Y: str    = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
+WCS_SCALE_SIZE_PARAM: str  = "ScaleSize"                    # OGC 12-039; nach GetCapabilities verifizieren
 WCS_SIZE_AXIS_X: str      = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
 WCS_SIZE_AXIS_Y: str      = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
 

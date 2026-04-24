@@ -109,6 +109,7 @@ Verified on: YYYY-MM-DD
 - WCS_GRID_ORIGIN_Y:
 - WCS_SUBSET_AXIS_X:
 - WCS_SUBSET_AXIS_Y:
+- WCS_SCALE_SIZE_PARAM:
 - WCS_SIZE_AXIS_X:
 - WCS_SIZE_AXIS_Y:
 - CRS URI:
@@ -131,7 +132,7 @@ Use a known tiny Munich-area bbox in EPSG:25832 and verify:
 
 - [ ] **Step 3: Propagate verified values into config defaults**
 
-Only after Step 1/2 are done, set `WCS_URL`, `WCS_COVERAGE_ID`, `WCS_MAX_PIXELS`, `WCS_GRID_ORIGIN_X/Y`, and WCS axis labels in `.env.example` / `config.py`.
+Only after Step 1/2 are done, set `WCS_URL`, `WCS_COVERAGE_ID`, `WCS_MAX_PIXELS`, `WCS_GRID_ORIGIN_X/Y`, WCS axis labels, and the WCS 2.0 scale-size parameter name in `.env.example` / `config.py`.
 
 - [ ] **Step 4: Commit**
 
@@ -216,6 +217,7 @@ WCS_COVERAGE_ID=by_dop20rgb
 WCS_VERSION=2.0.1
 WCS_SUBSET_AXIS_X=<from GetCapabilities>
 WCS_SUBSET_AXIS_Y=<from GetCapabilities>
+WCS_SCALE_SIZE_PARAM=ScaleSize
 WCS_SIZE_AXIS_X=<from GetCapabilities>
 WCS_SIZE_AXIS_Y=<from GetCapabilities>
 SAM3_CHECKPOINT=models/sam3.1_hiera_large.pt
@@ -270,6 +272,7 @@ def test_settings_defaults():
     assert s.WCS_VERSION == "2.0.1"
     assert s.WCS_SUBSET_AXIS_X == "PLACEHOLDER_UNTIL_VERIFIED"
     assert s.WCS_SUBSET_AXIS_Y == "PLACEHOLDER_UNTIL_VERIFIED"
+    assert s.WCS_SCALE_SIZE_PARAM == "ScaleSize"
     assert s.WCS_SIZE_AXIS_X == "PLACEHOLDER_UNTIL_VERIFIED"
     assert s.WCS_SIZE_AXIS_Y == "PLACEHOLDER_UNTIL_VERIFIED"
 
@@ -303,6 +306,7 @@ class Settings(BaseSettings):
     WCS_GRID_ORIGIN_Y: float = 0.0
     WCS_SUBSET_AXIS_X: str = "PLACEHOLDER_UNTIL_VERIFIED"
     WCS_SUBSET_AXIS_Y: str = "PLACEHOLDER_UNTIL_VERIFIED"
+    WCS_SCALE_SIZE_PARAM: str = "ScaleSize"
     WCS_SIZE_AXIS_X: str = "PLACEHOLDER_UNTIL_VERIFIED"
     WCS_SIZE_AXIS_Y: str = "PLACEHOLDER_UNTIL_VERIFIED"
 
@@ -1255,7 +1259,7 @@ git commit -m "feat(wcs): BBox prep with grid-snap, margin expansion, min-size"
 - Modify: `ki_geodaten/pipeline/wcs_client.py`
 - Test: `tests/pipeline/test_wcs_client.py` (append)
 
-**See Spec §5.1 pts 2, 3, 6, 7, 8 and Task 0** — pagination grid, HTTP with retry, round() for pixels, contiguous edges, BuildVRT. Axis labels and WCS version MUST come from verified config values, not hard-coded guesses.
+**See Spec §5.1 pts 2, 3, 6, 7, 8 and Task 0** — pagination grid, HTTP with retry, round() for pixels, contiguous edges, BuildVRT. Axis labels, WCS version, and the WCS 2.0 scaling parameter (`ScaleSize` unless Task 0 proves an LDBV-specific alternative) MUST come from verified config values, not hard-coded guesses.
 
 - [ ] **Step 1: Append failing tests**
 
@@ -1325,6 +1329,7 @@ def test_download_dop20_http_success(tmp_path, responses):
         wcs_url="http://example/wcs", coverage_id="cov1",
         max_pixels=4000, origin_x=0.0, origin_y=0.0,
         wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+        scale_size_param="ScaleSize",
         size_axis_x="E", size_axis_y="N",
     )
     assert vrt_path.exists()
@@ -1400,6 +1405,7 @@ def _fetch_chunk(
     session: requests.Session, wcs_url: str, coverage_id: str,
     chunk: ChunkPlan, out_path: Path, *,
     wcs_version: str, subset_axis_x: str, subset_axis_y: str,
+    scale_size_param: str,
     size_axis_x: str, size_axis_y: str,
 ) -> None:
     """WCS GetCoverage; axis labels/order are verified in Task 0 and passed via config."""
@@ -1417,7 +1423,9 @@ def _fetch_chunk(
         ],
         "subsettingcrs": "http://www.opengis.net/def/crs/EPSG/0/25832",
         "outputcrs":    "http://www.opengis.net/def/crs/EPSG/0/25832",
-        "size": [f"{size_axis_x}({w})", f"{size_axis_y}({h})"],
+        # WCS 2.0 Scaling Extension (OGC 12-039): normally `ScaleSize`.
+        # Keep the key configurable because Task 0 verifies LDBV capabilities.
+        scale_size_param: [f"{size_axis_x}({w})", f"{size_axis_y}({h})"],
     }
     try:
         r = session.get(wcs_url, params=params, timeout=(10, 60))
@@ -1434,6 +1442,7 @@ def download_dop20(
     *, wcs_url: str, coverage_id: str, max_pixels: int,
     origin_x: float, origin_y: float,
     wcs_version: str, subset_axis_x: str, subset_axis_y: str,
+    scale_size_param: str,
     size_axis_x: str, size_axis_y: str,
 ) -> Path:
     """Spec §5.1 signature. bbox_utm MUST be the already-prepared download_bbox."""
@@ -1450,6 +1459,7 @@ def download_dop20(
             session, wcs_url, coverage_id, c, p,
             wcs_version=wcs_version,
             subset_axis_x=subset_axis_x, subset_axis_y=subset_axis_y,
+            scale_size_param=scale_size_param,
             size_axis_x=size_axis_x, size_axis_y=size_axis_y,
         )
         chunk_files.append(str(p))
@@ -1882,6 +1892,20 @@ def test_local_nms_score_descending_priority():
     low  = MaskResult(mask=_mask((0, 0, 50, 50)), score=0.3, box_pixel=(0, 0, 50, 50))
     kept = local_mask_nms([low, high], iou_threshold=0.6, containment_ratio=0.9)
     assert kept == [high]
+
+def test_local_nms_bbox_prefilter_skips_disjoint_dense_masks(monkeypatch):
+    # Regression: disjoint candidates must not run full 1024x1024 logical_and
+    # comparisons for every pair.
+    a = MaskResult(mask=_mask((0, 0, 20, 20)), score=0.9, box_pixel=(0, 0, 20, 20))
+    b = MaskResult(mask=_mask((70, 70, 90, 90)), score=0.8, box_pixel=(70, 70, 90, 90))
+
+    def fail_iou(*args, **kwargs):
+        raise AssertionError("dense IoU should not run for disjoint boxes")
+
+    import ki_geodaten.pipeline.segmenter as segmenter
+    monkeypatch.setattr(segmenter, "_iou", fail_iou)
+    monkeypatch.setattr(segmenter, "_containment", fail_iou)
+    assert local_mask_nms([a, b], iou_threshold=0.6, containment_ratio=0.9) == [a, b]
 ```
 
 - [ ] **Step 2: Run to confirm failure**
@@ -1919,6 +1943,14 @@ def _containment(a: np.ndarray, b: np.ndarray) -> float:
         return 0.0
     return inter / min_area
 
+def _boxes_intersect(
+    a: tuple[int, int, int, int],
+    b: tuple[int, int, int, int],
+) -> bool:
+    ar0, ac0, ar1, ac1 = a
+    br0, bc0, br1, bc1 = b
+    return min(ar1, br1) > max(ar0, br0) and min(ac1, bc1) > max(ac0, bc0)
+
 def local_mask_nms(
     masks: Iterable[MaskResult],
     *, iou_threshold: float, containment_ratio: float,
@@ -1929,6 +1961,10 @@ def local_mask_nms(
     for cand in sorted_masks:
         drop = False
         for keep in kept:
+            # Cheap bbox gate first; only overlapping boxes can have non-zero
+            # mask IoU/containment. This avoids O(N^2) dense 1024x1024 scans.
+            if not _boxes_intersect(cand.box_pixel, keep.box_pixel):
+                continue
             if _iou(cand.mask, keep.mask) >= iou_threshold:
                 drop = True; break
             if _containment(cand.mask, keep.mask) >= containment_ratio:
@@ -1963,9 +1999,9 @@ class Sam3Segmenter:
     def predict(self, tile, prompt: str) -> list[MaskResult]:
         if self._model is None:
             self.load()
-        raw = self._model.predict(tile.array, prompt)
-        return local_mask_nms(
-            raw, iou_threshold=self.iou_threshold, containment_ratio=self.containment_ratio,
+        raise NotImplementedError(
+            "Task 12A must verify the real SAM 3.1 prediction API and implement "
+            "tensor-to-CPU NumPy normalization before production inference is wired."
         )
 
     def encoder_token_count(self, prompt: str) -> int:
@@ -2001,7 +2037,7 @@ class Sam3TextTokenCounter:
         return int(self._tokenizer(prompt, add_special_tokens=True).input_ids.shape[-1])
 ```
 
-Note: `sam3` model and tokenizer APIs are placeholders until Task 12A is completed. Do not implement Worker/API integration against these placeholders without first verifying the upstream signatures.
+Note: `sam3` model and tokenizer APIs are placeholders until Task 12A is completed. `Sam3Segmenter.predict()` intentionally raises until the real adapter is implemented. Do not implement Worker/API integration against this placeholder.
 
 - [ ] **Step 4: Run tests**
 
@@ -2041,6 +2077,8 @@ Required adapter behavior:
 - `mask` is tile-local shape `(1024, 1024)` and boolean.
 - `box_pixel` uses `(row0, col0, row1, col1)` coordinates matching `keep_center_only`.
 - Scores are floats in `[0, 1]`.
+- No `torch.Tensor` may reach `local_mask_nms`; masks/scores/boxes must be detached, moved to CPU, and converted to isolated NumPy/Python values first. Mask conversion must use `.detach().cpu().numpy().copy()` so returned NumPy arrays do not keep PyTorch tensor storage alive.
+- Per-tile raw SAM outputs and temporary tensors must be dropped (`del raw`, `del tensor_refs`, etc.) before returning so the orchestrator's per-tile `torch.cuda.empty_cache()` can actually release VRAM.
 - Raw model outputs are passed through `local_mask_nms`.
 - Device placement never loads a second GPU model in the FastAPI process.
 
@@ -2367,7 +2405,7 @@ git commit -m "feat(merger): raster→polygon with connectivity=8, polygon-only,
 - Create: `ki_geodaten/pipeline/exporter.py`
 - Test: `tests/pipeline/test_exporter.py`
 
-**See Spec §5.5** — AOI clip (Clip-Window-Semantik), re-export overwrite, empty layers with explicit schema AND explicit CRS, `nodata_regions` carries safe-center footprints (caller responsibility).
+**See Spec §5.5** — AOI clip (Clip-Window-Semantik), re-export overwrite, empty layers with explicit schema AND explicit CRS, `nodata_regions` carries safe-center footprints (caller responsibility). The clipped export is the user-facing AOI product; for metrics, reference data must be clipped the same way. Do not switch this to an `intersects(aoi)` full-object filter unless the product semantics are explicitly changed.
 
 - [ ] **Step 1: Write failing test**
 
@@ -2462,6 +2500,21 @@ def test_export_empty_detected_has_explicit_crs(tmp_path: Path):
         assert "source_tile_row" in props
         assert "source_tile_col" in props
 
+def test_export_empty_nodata_has_explicit_schema(tmp_path: Path):
+    out = tmp_path / "j.gpkg"
+    export_two_layer_gpkg(
+        detected_gdf=_detected_gdf([]),
+        nodata_gdf=_nodata_gdf([]),
+        requested_bbox=_aoi(),
+        out_path=out,
+    )
+    gdf = gpd.read_file(out, layer="nodata_regions")
+    assert len(gdf) == 0
+    assert str(gdf.crs) == "EPSG:25832"
+    with fiona.open(str(out), layer="nodata_regions") as src:
+        props = src.schema["properties"]
+        assert "reason" in props
+
 def test_export_overwrites_existing_file(tmp_path: Path):
     out = tmp_path / "j.gpkg"
     p1 = Polygon([(691100, 5335100), (691200, 5335100),
@@ -2472,6 +2525,18 @@ def test_export_overwrites_existing_file(tmp_path: Path):
     export_two_layer_gpkg(_detected_gdf([p2]), _nodata_gdf([]), _aoi(), out)
     gdf = gpd.read_file(out, layer="detected_objects")
     assert len(gdf) == 1   # only p2, not p1 + p2
+
+def test_export_overwrite_removes_sqlite_sidecars(tmp_path: Path):
+    out = tmp_path / "j.gpkg"
+    out.write_bytes(b"old")
+    out.with_suffix(".gpkg-wal").write_bytes(b"old wal")
+    out.with_suffix(".gpkg-shm").write_bytes(b"old shm")
+    inside = Polygon([(691100, 5335100), (691200, 5335100),
+                      (691200, 5335200), (691100, 5335200)])
+    export_two_layer_gpkg(_detected_gdf([inside]), _nodata_gdf([]), _aoi(), out)
+    assert out.exists()
+    assert not out.with_suffix(".gpkg-wal").exists()
+    assert not out.with_suffix(".gpkg-shm").exists()
 ```
 
 - [ ] **Step 2: Run to confirm failure**
@@ -2500,6 +2565,18 @@ _CRS = "EPSG:25832"
 
 _EMPTY_DETECTED_COLS = ("score", "source_tile_row", "source_tile_col")
 _EMPTY_NODATA_COLS = ("reason",)
+_DETECTED_SCHEMA = {
+    "geometry": "Polygon",
+    "properties": {
+        "score": "float",
+        "source_tile_row": "int",
+        "source_tile_col": "int",
+    },
+}
+_NODATA_SCHEMA = {
+    "geometry": "Polygon",
+    "properties": {"reason": "str"},
+}
 
 def _clip_and_normalize(
     gdf: gpd.GeoDataFrame, aoi: BaseGeometry,
@@ -2533,6 +2610,17 @@ def _empty_with_schema(cols: Iterable[str]) -> gpd.GeoDataFrame:
         {c: [] for c in cols}, geometry=[], crs=_CRS,
     )
 
+def _unlink_gpkg_family(out_path: Path) -> None:
+    """Delete GeoPackage plus SQLite sidecars before re-export.
+
+    GeoPackage is SQLite. If a previous writer left `*.gpkg-wal`/`*.gpkg-shm`
+    beside the main file, deleting only the main DB can corrupt the next fresh
+    file created under the same name.
+    """
+    out_path.unlink(missing_ok=True)
+    out_path.with_suffix(".gpkg-wal").unlink(missing_ok=True)
+    out_path.with_suffix(".gpkg-shm").unlink(missing_ok=True)
+
 def export_two_layer_gpkg(
     detected_gdf: gpd.GeoDataFrame,
     nodata_gdf: gpd.GeoDataFrame,
@@ -2541,7 +2629,7 @@ def export_two_layer_gpkg(
 ) -> None:
     """Spec §5.5 signature. Overwrites out_path unconditionally."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.unlink(missing_ok=True)
+    _unlink_gpkg_family(out_path)
 
     det = _clip_and_normalize(detected_gdf, requested_bbox)
     nod = _clip_and_normalize(nodata_gdf, requested_bbox)
@@ -2551,8 +2639,16 @@ def export_two_layer_gpkg(
     if len(nod) == 0:
         nod = _empty_with_schema(_EMPTY_NODATA_COLS)
 
-    det.to_file(out_path, layer=_DETECTED_LAYER, driver="GPKG")
-    nod.to_file(out_path, layer=_NODATA_LAYER, driver="GPKG")
+    # Explicit schema is required for empty layers; use Fiona because pyogrio
+    # ignores/does not support the schema kwarg in common GeoPandas versions.
+    det.to_file(
+        out_path, layer=_DETECTED_LAYER, driver="GPKG",
+        schema=_DETECTED_SCHEMA, engine="fiona",
+    )
+    nod.to_file(
+        out_path, layer=_NODATA_LAYER, driver="GPKG",
+        schema=_NODATA_SCHEMA, engine="fiona",
+    )
 ```
 
 - [ ] **Step 4: Run tests**
@@ -2575,7 +2671,7 @@ git commit -m "feat(exporter): two-layer GPKG with AOI clip, overwrite, and empt
 - Create: `ki_geodaten/app/serialization.py`
 - Test: `tests/app/test_serialization.py`
 
-**See Spec §8** — transform EPSG:25832 → EPSG:4326, `shapely.set_precision(grid_size=1e-6)`, AOI clip uses `bbox_utm_snapped` in UTM **before** transform.
+**See Spec §8** — transform EPSG:25832 → EPSG:4326, `shapely.set_precision(grid_size=1e-6)`, AOI clip uses `bbox_utm_snapped` in UTM **before** transform, and the ProcessPool target returns a finished JSON string so FastAPI does not serialize large FeatureCollections on the event loop. The AOI clip is intentional Clip-Window-Semantik; metrics must clip reference features equivalently.
 
 This module is intended to run inside a `ProcessPoolExecutor` (Task 21). No HTTP state here; only pure serialization.
 
@@ -2591,6 +2687,7 @@ from shapely.wkb import dumps as wkb_dumps
 from ki_geodaten.app.serialization import (
     build_polygons_feature_collection,
     build_nodata_feature_collection,
+    build_polygons_geojson,
 )
 
 def _aoi_utm():
@@ -2655,6 +2752,15 @@ def test_feature_collection_is_json_serializable():
              "score": 0.5, "validation": "ACCEPTED"}]
     fc = build_polygons_feature_collection(rows, aoi_utm=_aoi_utm())
     json.dumps(fc)  # must not raise
+
+def test_processpool_builder_returns_json_string():
+    poly = Polygon([(691100, 5335100), (691200, 5335100),
+                    (691200, 5335200), (691100, 5335200)])
+    rows = [{"id": 1, "geometry_wkb": _poly_wkb(poly),
+             "score": 0.5, "validation": "ACCEPTED"}]
+    payload = build_polygons_geojson(rows, aoi_utm=_aoi_utm())
+    assert isinstance(payload, str)
+    assert json.loads(payload)["type"] == "FeatureCollection"
 ```
 
 - [ ] **Step 2: Run to confirm failure**
@@ -2667,6 +2773,7 @@ Expected: FAIL.
 ```python
 # ki_geodaten/app/serialization.py
 from __future__ import annotations
+import json
 from typing import Iterable
 import shapely
 from shapely.geometry import box, mapping
@@ -2694,9 +2801,10 @@ def _clip_transform_precision(geom, aoi_utm_polygon):
     for poly in polys:
         p_4326 = _transform_to_4326(poly)
         p_4326 = shapely.set_precision(p_4326, grid_size=_PRECISION_DEG)
-        if p_4326.is_empty:
-            continue
-        out.append(p_4326)
+        # Precision reduction can collapse/sliver polygons; validate and run
+        # the polygon-only filter again after rounding.
+        p_4326 = make_valid(p_4326)
+        out.extend(extract_polygons(p_4326))
     return out
 
 def _feature_collection(features: list[dict]) -> dict:
@@ -2722,6 +2830,13 @@ def build_polygons_feature_collection(
             })
     return _feature_collection(features)
 
+def build_polygons_geojson(
+    rows: Iterable[dict], *, aoi_utm: tuple[float, float, float, float],
+) -> str:
+    """ProcessPool target: returns already-serialized JSON to avoid blocking
+    FastAPI's event loop with a large json.dumps in the route."""
+    return json.dumps(build_polygons_feature_collection(rows, aoi_utm=aoi_utm))
+
 def build_nodata_feature_collection(
     rows: Iterable[dict], *, aoi_utm: tuple[float, float, float, float],
 ) -> dict:
@@ -2737,6 +2852,12 @@ def build_nodata_feature_collection(
                 "properties": {"reason": r["reason"]},
             })
     return _feature_collection(features)
+
+def build_nodata_geojson(
+    rows: Iterable[dict], *, aoi_utm: tuple[float, float, float, float],
+) -> str:
+    """ProcessPool target: returns already-serialized JSON."""
+    return json.dumps(build_nodata_feature_collection(rows, aoi_utm=aoi_utm))
 ```
 
 - [ ] **Step 4: Run tests**
@@ -2920,6 +3041,7 @@ def test_orchestrator_happy_path_marks_ready(tmp_path, monkeypatch):
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
             wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            scale_size_param="ScaleSize",
             size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
@@ -2950,6 +3072,7 @@ def test_orchestrator_records_oom_as_nodata(tmp_path, monkeypatch):
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
             wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            scale_size_param="ScaleSize",
             size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
@@ -2971,6 +3094,7 @@ def test_orchestrator_records_inference_error_as_nodata(tmp_path, monkeypatch):
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
             wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            scale_size_param="ScaleSize",
             size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
@@ -2990,6 +3114,7 @@ def test_orchestrator_records_nodata_tile_without_invoking_segmenter(tmp_path, m
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
             wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            scale_size_param="ScaleSize",
             size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
@@ -3007,6 +3132,7 @@ def test_orchestrator_catches_download_error_marks_failed(tmp_path, monkeypatch)
     run_job(db, job_id="j1", segmenter=_StubSegmenter([]), data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
             wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            scale_size_param="ScaleSize",
             size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
@@ -3063,6 +3189,18 @@ def _empty_cuda_cache() -> None:
     except Exception:
         pass
 
+def _clear_exception_context(exc: BaseException) -> None:
+    """Break traceback/frame references before CUDA cache flush.
+
+    In Python 3, `except Exception as exc` keeps `exc.__traceback__` alive until
+    the except block exits. If the failing SAM frame owns temporary GPU tensors,
+    `torch.cuda.empty_cache()` cannot release that memory while the traceback is
+    still referenced.
+    """
+    exc.__traceback__ = None
+    exc.__context__ = None
+    exc.__cause__ = None
+
 def _traceback_tail(exc: BaseException, n: int = 20) -> str:
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     lines = tb.splitlines()
@@ -3099,6 +3237,7 @@ def run_job(
     db_path: Path, *, job_id: str, segmenter, data_root: Path,
     wcs_url: str, coverage_id: str, max_pixels: int,
     wcs_version: str, subset_axis_x: str, subset_axis_y: str,
+    scale_size_param: str,
     size_axis_x: str, size_axis_y: str,
     origin_x: float, origin_y: float, min_polygon_area_m2: float,
     safe_center_nodata_threshold: float,
@@ -3130,6 +3269,7 @@ def run_job(
             max_pixels=max_pixels, origin_x=origin_x, origin_y=origin_y,
             wcs_version=wcs_version,
             subset_axis_x=subset_axis_x, subset_axis_y=subset_axis_y,
+            scale_size_param=scale_size_param,
             size_axis_x=size_axis_x, size_axis_y=size_axis_y,
         )
         update_status(db_path, job_id, JobStatus.INFERRING, dop_vrt_path=str(vrt_path))
@@ -3157,6 +3297,8 @@ def run_job(
                 reason = NoDataReason.OOM if _is_cuda_oom(exc) else NoDataReason.INFERENCE_ERROR
                 _persist_safe_center_nodata(db_path, job_id, tile, reason)
                 increment_tile_failed(db_path, job_id)
+                _clear_exception_context(exc)
+                del exc
                 _empty_cuda_cache()
                 continue
 
@@ -3170,6 +3312,8 @@ def run_job(
                 _persist_safe_center_nodata(db_path, job_id, tile,
                                             NoDataReason.INVALID_GEOMETRY)
                 increment_tile_failed(db_path, job_id)
+                _clear_exception_context(exc)
+                del exc
             finally:
                 _empty_cuda_cache()
 
@@ -3278,6 +3422,7 @@ def test_run_forever_exits_after_max_jobs(tmp_path, monkeypatch):
         segmenter_factory=lambda: _StubSegmenter(),
         wcs_url="", coverage_id="", max_pixels=4000,
         wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+        scale_size_param="ScaleSize",
         size_axis_x="E", size_axis_y="N",
         origin_x=0.0, origin_y=0.0,
         min_polygon_area_m2=1.0, safe_center_nodata_threshold=0.0,
@@ -3335,6 +3480,7 @@ def run_forever(
     segmenter_factory: Callable[[], object],
     wcs_url: str, coverage_id: str, max_pixels: int,
     wcs_version: str, subset_axis_x: str, subset_axis_y: str,
+    scale_size_param: str,
     size_axis_x: str, size_axis_y: str,
     origin_x: float, origin_y: float,
     min_polygon_area_m2: float, safe_center_nodata_threshold: float,
@@ -3364,6 +3510,7 @@ def run_forever(
                 max_pixels=max_pixels,
                 wcs_version=wcs_version,
                 subset_axis_x=subset_axis_x, subset_axis_y=subset_axis_y,
+                scale_size_param=scale_size_param,
                 size_axis_x=size_axis_x, size_axis_y=size_axis_y,
                 origin_x=origin_x, origin_y=origin_y,
                 min_polygon_area_m2=min_polygon_area_m2,
@@ -3392,6 +3539,7 @@ def main() -> None:   # pragma: no cover
         wcs_version=settings.WCS_VERSION,
         subset_axis_x=settings.WCS_SUBSET_AXIS_X,
         subset_axis_y=settings.WCS_SUBSET_AXIS_Y,
+        scale_size_param=settings.WCS_SCALE_SIZE_PARAM,
         size_axis_x=settings.WCS_SIZE_AXIS_X,
         size_axis_y=settings.WCS_SIZE_AXIS_Y,
         origin_x=settings.WCS_GRID_ORIGIN_X, origin_y=settings.WCS_GRID_ORIGIN_Y,
@@ -3496,6 +3644,24 @@ def test_cleanup_cascades_to_polygons(tmp_path):
     with connect(db) as conn:
         n = conn.execute("SELECT COUNT(*) FROM polygons WHERE job_id='old'").fetchone()[0]
     assert n == 0
+
+def test_cleanup_batches_large_delete_set(tmp_path):
+    # Regression: a single IN (?, ?, ...) can exceed SQLITE_MAX_VARIABLE_NUMBER
+    db = tmp_path / "j.db"
+    results = tmp_path / "results"
+    results.mkdir()
+    init_schema(db)
+    old_when = datetime.now(timezone.utc) - timedelta(days=10)
+    for i in range(1050):
+        jid = f"old_{i}"
+        insert_job(db, job_id=jid, prompt="p",
+                   bbox_wgs84=[0,0,1,1], bbox_utm_snapped=[0,0,1,1],
+                   tile_preset=TilePreset.MEDIUM)
+        update_status(db, jid, JobStatus.FAILED,
+                      error_reason="WCS_TIMEOUT", set_finished=True)
+        _set_finished_at(db, jid, old_when)
+    deleted = cleanup_old_jobs(db, results_dir=results, retention_days=7)
+    assert len(deleted) == 1050
 ```
 
 - [ ] **Step 2: Run to confirm failure**
@@ -3515,6 +3681,7 @@ from pathlib import Path
 from ki_geodaten.jobs.store import connect
 
 logger = logging.getLogger(__name__)
+_DELETE_BATCH_SIZE = 900
 
 def cleanup_old_jobs(
     db_path: Path, *, results_dir: Path, retention_days: int,
@@ -3531,9 +3698,10 @@ def cleanup_old_jobs(
         ).fetchall()
         ids = [r["id"] for r in rows]
         gpkg_paths = [r["gpkg_path"] for r in rows if r["gpkg_path"]]
-        if ids:
-            placeholders = ",".join("?" * len(ids))
-            conn.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", ids)
+        for i in range(0, len(ids), _DELETE_BATCH_SIZE):
+            batch = ids[i:i + _DELETE_BATCH_SIZE]
+            placeholders = ",".join("?" * len(batch))
+            conn.execute(f"DELETE FROM jobs WHERE id IN ({placeholders})", batch)
         conn.execute("COMMIT")
         conn.execute("VACUUM")
     for path_str in gpkg_paths:
@@ -4388,7 +4556,7 @@ git commit -m "feat(api): export endpoint with lock, exported_revision, chunk cl
 - Create: `ki_geodaten/app/routes/geojson.py`
 - Test: `tests/app/test_routes_geojson.py`
 
-**See Spec §8** — runs WKB→GeoJSON in `app.state.geojson_executor`, key cache by `(job_id, validation_revision, target)`.
+**See Spec §8** — runs WKB→GeoJSON and `json.dumps(...)` in `app.state.geojson_executor`, key cache by `(job_id, validation_revision, target)`. The route returns a raw `Response` with the already-serialized JSON string so the FastAPI event loop does not serialize multi-MB dictionaries.
 
 Because `ProcessPoolExecutor` submits picklable callables, the function invoked in the pool must be a module-level function that takes plain Python data (already in `ki_geodaten/app/serialization.py`).
 
@@ -4486,10 +4654,10 @@ from __future__ import annotations
 import asyncio
 import functools
 import json
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Response
 
 from ki_geodaten.app.serialization import (
-    build_polygons_feature_collection, build_nodata_feature_collection,
+    build_polygons_geojson, build_nodata_geojson,
 )
 from ki_geodaten.jobs.store import (
     get_job, get_polygons_for_job, get_nodata_for_job,
@@ -4521,14 +4689,14 @@ async def get_polygons(job_id: str, request: Request):
     key = (job_id, revision, "polygons")
     cache = request.app.state.geojson_cache
     if key in cache:
-        return cache[key]
+        return Response(content=cache[key], media_type="application/json")
     rows = get_polygons_for_job(request.app.state.db_path, job_id)
-    fc = await _run_in_executor(
-        request.app, build_polygons_feature_collection,
+    payload = await _run_in_executor(
+        request.app, build_polygons_geojson,
         rows, aoi_utm=_aoi(job),
     )
-    cache[key] = fc
-    return fc
+    cache[key] = payload
+    return Response(content=payload, media_type="application/json")
 
 @router.get("/jobs/{job_id}/nodata")
 async def get_nodata(job_id: str, request: Request):
@@ -4539,14 +4707,14 @@ async def get_nodata(job_id: str, request: Request):
     key = (job_id, revision, "nodata")
     cache = request.app.state.geojson_cache
     if key in cache:
-        return cache[key]
+        return Response(content=cache[key], media_type="application/json")
     rows = get_nodata_for_job(request.app.state.db_path, job_id)
-    fc = await _run_in_executor(
-        request.app, build_nodata_feature_collection,
+    payload = await _run_in_executor(
+        request.app, build_nodata_geojson,
         rows, aoi_utm=_aoi(job),
     )
-    cache[key] = fc
-    return fc
+    cache[key] = payload
+    return Response(content=payload, media_type="application/json")
 ```
 
 - [ ] **Step 4: Run tests**
@@ -4691,6 +4859,7 @@ input, select, button { width: 100%; padding: 6px; box-sizing: border-box; }
   // ── Validation debouncing state (declared before openJob because openJob uses it) ──
   const pendingUpdates = new Map();
   let flushTimer = null;
+  let isFlushing = false;
   const MAX_CLIENT_BUFFER_UPDATES = 100;
 
   const storageKey = id => `job:${id}:pending-validations`;
@@ -4847,6 +5016,7 @@ input, select, button { width: 100%; padding: 6px; box-sizing: border-box; }
     if (!currentJobId) return;
     pendingUpdates.set(pid, validation);
     persistPending(currentJobId);
+    if (isFlushing) return;
     if (pendingUpdates.size >= MAX_CLIENT_BUFFER_UPDATES) {
       void flushValidations();
       return;
@@ -4856,12 +5026,14 @@ input, select, button { width: 100%; padding: 6px; box-sizing: border-box; }
   }
 
   async function flushValidations() {
-    if (!pendingUpdates.size || !currentJobId) return;
+    if (isFlushing || !pendingUpdates.size || !currentJobId) return;
+    isFlushing = true;
     const jobId = currentJobId;
     // Snapshot BUT keep pending in memory until the POST succeeds — otherwise
     // a network error silently loses the user's validations (Spec §9.2).
     const snapshot = new Map(pendingUpdates);
     const updates = [...snapshot].map(([pid, validation]) => ({pid, validation}));
+    let failed = false;
     try {
       const r = await fetch(`/jobs/${jobId}/polygons/validate_bulk`, {
         method: 'POST',
@@ -4883,18 +5055,31 @@ input, select, button { width: 100%; padding: 6px; box-sizing: border-box; }
     } catch (e) {
       // Network / server error: leave pending intact for next retry.
       // Re-persist so the current snapshot is durable across refresh.
+      failed = true;
       persistPending(jobId);
+    } finally {
+      isFlushing = false;
+      if (pendingUpdates.size && currentJobId === jobId) {
+        if (flushTimer) clearTimeout(flushTimer);
+        flushTimer = setTimeout(
+          () => void flushValidations(),
+          failed ? 3000 : 0,
+        );
+      }
     }
   }
 
   window.addEventListener('pagehide', () => {
     if (!pendingUpdates.size || !currentJobId) return;
     persistPending(currentJobId);   // Durable recovery path.
-    const blob = new Blob(
-      [JSON.stringify({updates: snapshotUpdates().slice(0, MAX_CLIENT_BUFFER_UPDATES)})],
-      {type: 'application/json'},
-    );
-    navigator.sendBeacon(`/jobs/${currentJobId}/polygons/validate_bulk`, blob);
+    fetch(`/jobs/${currentJobId}/polygons/validate_bulk`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        updates: snapshotUpdates().slice(0, MAX_CLIENT_BUFFER_UPDATES),
+      }),
+      keepalive: true,
+    }).catch(() => {});
   });
 
   exportBtn.onclick = async () => {
@@ -5076,6 +5261,7 @@ def test_end_to_end(tmp_path, monkeypatch):
             segmenter_factory=_StubSegmenter,
             wcs_url="", coverage_id="", max_pixels=4000,
             wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            scale_size_param="ScaleSize",
             size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0,
             min_polygon_area_m2=0.01, safe_center_nodata_threshold=0.0,
@@ -5169,6 +5355,7 @@ WCS_GRID_ORIGIN_X=<from GetCapabilities>
 WCS_GRID_ORIGIN_Y=<from GetCapabilities>
 WCS_SUBSET_AXIS_X=<from GetCapabilities, e.g. E>
 WCS_SUBSET_AXIS_Y=<from GetCapabilities, e.g. N>
+WCS_SCALE_SIZE_PARAM=ScaleSize
 WCS_SIZE_AXIS_X=<from GetCapabilities, e.g. E>
 WCS_SIZE_AXIS_Y=<from GetCapabilities, e.g. N>
 ```
@@ -5233,16 +5420,22 @@ Before marking the plan done, verify:
 - [ ] `nodata_regions.geometry_wkb` always stores the **safe-center** polygon (size-2·margin), never the full tile.
 - [ ] `bbox_utm_snapped` is the unexpanded user AOI; the download bbox is only used at download time.
 - [ ] GeoJSON responses and GPKG are both clipped to `bbox_utm_snapped` (Clip-Window-Semantik).
+- [ ] AOI-clipped outputs are evaluated only against equivalently AOI-clipped reference data; they are not compared against full ALKIS objects.
 - [ ] `masks_to_polygons` uses `connectivity=8` and excludes `value != 1`.
 - [ ] Worker never holds a write transaction longer than one tile.
 - [ ] Export route is wrapped by `app.state.export_lock`.
 - [ ] Export route refreshes `finished_at` when setting `EXPORTED`, so retention starts at export time.
 - [ ] `validate_bulk` uses `executemany`, never variadic `VALUES(...)`.
 - [ ] GeoJSON precision ≤ 1e-6° (set via `shapely.set_precision`).
+- [ ] GeoJSON geometry validation and polygon-only filtering run after `set_precision`, not only before it.
 - [ ] Bayern fence AND UTM-area check are both enforced in `POST /jobs`.
 - [ ] `run-server.sh` passes `--reload-exclude 'data/*' --reload-exclude '*.db*'`.
 - [ ] Worker startup hook both marks DOWNLOADING/INFERRING jobs as FAILED **and** rmtree's orphan `data/dop/*` directories.
 - [ ] Retention cleanup CASCADEs polygon/nodata deletion and removes `.gpkg` files.
+- [ ] Retention cleanup deletes jobs in batches of ≤900 IDs, never one giant `IN (...)` clause.
+- [ ] Empty GeoPackage layers are written with explicit Fiona schema and explicit CRS, not inferred from an empty GeoDataFrame.
+- [ ] Re-export deletes `.gpkg`, `.gpkg-wal`, and `.gpkg-shm` before writing a fresh GeoPackage.
+- [ ] NoData detection uses GDAL/raster dataset masks only (`src.dataset_mask(...) == 0`), never raw RGB-black heuristics.
 
 **Bugs found during plan review — must stay fixed**
 - [ ] `POST /jobs/{id}/export` is declared as `def` (not `async def`), so the blocking GDAL/Fiona call runs in FastAPI's threadpool and doesn't block the event loop.
@@ -5250,12 +5443,21 @@ Before marking the plan done, verify:
 - [ ] Orchestrator catches `Exception` (NOT `BaseException`) around `segmenter.predict(...)` — `BaseException` would eat Ctrl-C / SystemExit.
 - [ ] Orchestrator iterates tiles lazily (`for tile in iter_tiles(...)`) and obtains `tile_total` via a cheap `iter_grid(src, cfg)` count — never materializes all tiles in memory.
 - [ ] Geojson route uses `functools.partial`, not a lambda, when submitting to `ProcessPoolExecutor` (lambdas are not picklable).
+- [ ] Geojson ProcessPool functions return finished JSON strings; FastAPI routes return `Response(content=..., media_type="application/json")` and do not serialize large dicts on the event loop.
+- [ ] WCS GetCoverage uses the verified WCS 2.0 scaling parameter name (`ScaleSize` by default), not an unverified `size` KVP.
 - [ ] Export route unpickles via module-level `update_status` import (no in-function `from ... import ... as _us` shadowing).
 - [ ] `_job_view` returns `bbox_wgs84` as a parsed **array**, not a JSON string.
 - [ ] Frontend styles polygons via native Leaflet `style` options (color / fillColor / dashArray), NOT CSS classes — `L.canvas()` ignores per-feature className.
 - [ ] Frontend progress displays `(tile_completed + tile_failed) / tile_total`, not only successful tiles.
 - [ ] Frontend `openJob(id)` flushes to the PREVIOUS `currentJobId` before switching, then clears `pendingUpdates`, then calls `hydratePending(id)` so session-persisted updates are recovered.
 - [ ] Frontend `flushValidations()` only removes entries from `pendingUpdates` AFTER a successful POST; on network/server error the batch stays in memory and is re-persisted for retry.
+- [ ] Frontend `pagehide` uses `fetch(..., keepalive: true)` for the final JSON POST; it does not use JSON `sendBeacon()`.
+- [ ] Frontend validation flush has an `isFlushing` guard so buffer-threshold clicks cannot spawn parallel duplicate POSTs.
+- [ ] `Sam3Segmenter.predict()` converts all SAM tensors to detached CPU NumPy/Python values before `local_mask_nms`; no GPU tensor reaches NumPy code.
+- [ ] SAM mask conversion uses `.detach().cpu().numpy().copy()` so returned NumPy arrays do not keep PyTorch tensor storage alive.
+- [ ] Per-tile SAM raw outputs and temporary tensor refs are deleted before returning from `predict()`, so the orchestrator's `torch.cuda.empty_cache()` can release VRAM.
+- [ ] `local_mask_nms` runs a `box_pixel` overlap prefilter before any dense mask IoU/containment comparison.
+- [ ] Orchestrator clears per-tile exception traceback/context before `torch.cuda.empty_cache()` after OOM/inference failures.
 
 **Production hardening**
 - [ ] `app.state.token_counter` uses the **real SAM text tokenizer only** in production; it never builds the SAM vision model or allocates CUDA memory. The whitespace-split fallback logs a WARNING (never silent).
