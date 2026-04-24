@@ -85,6 +85,63 @@ ki_geodaten/
 
 ---
 
+## Task 0: WCS Capabilities Verification Gate
+
+**Files:**
+- Create: `docs/wcs-verification.md`
+
+**Must complete before Task 7/8 implementation.** The WCS client must not hard-code guessed LDBV request axes, coverage IDs, grid origins, or pixel limits. Verify them once from a real `GetCapabilities` / coverage description response and document the values.
+
+- [ ] **Step 1: Verify LDBV WCS metadata manually**
+
+Record these values in `docs/wcs-verification.md`:
+
+```markdown
+# LDBV DOP20 WCS Verification
+
+Verified on: YYYY-MM-DD
+
+- WCS_URL:
+- WCS_VERSION:
+- WCS_COVERAGE_ID:
+- WCS_MAX_PIXELS:
+- WCS_GRID_ORIGIN_X:
+- WCS_GRID_ORIGIN_Y:
+- WCS_SUBSET_AXIS_X:
+- WCS_SUBSET_AXIS_Y:
+- WCS_SIZE_AXIS_X:
+- WCS_SIZE_AXIS_Y:
+- CRS URI:
+
+Evidence:
+- GetCapabilities URL:
+- DescribeCoverage URL:
+- Relevant XML snippets:
+- One tested GetCoverage URL:
+- Result of adjacent-chunk edge test:
+```
+
+- [ ] **Step 2: Validate one tiny `GetCoverage` request**
+
+Use a known tiny Munich-area bbox in EPSG:25832 and verify:
+- The server accepts the selected `subset` axis labels/order.
+- The response has CRS EPSG:25832.
+- Pixel dimensions match `round((max-min)/0.2)`.
+- Two adjacent test chunks with `next_minx = prev_maxx` mosaic without a gap or duplicate pixel row/column.
+
+- [ ] **Step 3: Propagate verified values into config defaults**
+
+Only after Step 1/2 are done, set `WCS_URL`, `WCS_COVERAGE_ID`, `WCS_MAX_PIXELS`, `WCS_GRID_ORIGIN_X/Y`, and WCS axis labels in `.env.example` / `config.py`.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add docs/wcs-verification.md
+git commit -m "docs: verify LDBV DOP20 WCS capabilities"
+```
+
+---
+
 ## Task 1: Project Scaffolding & Dependencies
 
 **Files:**
@@ -156,6 +213,11 @@ models/*.pt
 ```
 WCS_URL=https://geoservices.bayern.de/wcs/v2/dop20
 WCS_COVERAGE_ID=by_dop20rgb
+WCS_VERSION=2.0.1
+WCS_SUBSET_AXIS_X=<from GetCapabilities>
+WCS_SUBSET_AXIS_Y=<from GetCapabilities>
+WCS_SIZE_AXIS_X=<from GetCapabilities>
+WCS_SIZE_AXIS_Y=<from GetCapabilities>
 SAM3_CHECKPOINT=models/sam3.1_hiera_large.pt
 ```
 
@@ -205,6 +267,11 @@ def test_settings_defaults():
     assert s.RETENTION_DAYS == 7
     assert s.WCS_GRID_ORIGIN_X == 0.0
     assert s.WCS_GRID_ORIGIN_Y == 0.0
+    assert s.WCS_VERSION == "2.0.1"
+    assert s.WCS_SUBSET_AXIS_X == "PLACEHOLDER_UNTIL_VERIFIED"
+    assert s.WCS_SUBSET_AXIS_Y == "PLACEHOLDER_UNTIL_VERIFIED"
+    assert s.WCS_SIZE_AXIS_X == "PLACEHOLDER_UNTIL_VERIFIED"
+    assert s.WCS_SIZE_AXIS_Y == "PLACEHOLDER_UNTIL_VERIFIED"
 
 def test_settings_env_override(monkeypatch):
     monkeypatch.setenv("MAX_BBOX_AREA_KM2", "2.5")
@@ -230,9 +297,14 @@ class Settings(BaseSettings):
     # WCS
     WCS_URL: str = "PLACEHOLDER_UNTIL_VERIFIED"
     WCS_COVERAGE_ID: str = "PLACEHOLDER_UNTIL_VERIFIED"
+    WCS_VERSION: str = "2.0.1"
     WCS_MAX_PIXELS: int = 4000
     WCS_GRID_ORIGIN_X: float = 0.0
     WCS_GRID_ORIGIN_Y: float = 0.0
+    WCS_SUBSET_AXIS_X: str = "PLACEHOLDER_UNTIL_VERIFIED"
+    WCS_SUBSET_AXIS_Y: str = "PLACEHOLDER_UNTIL_VERIFIED"
+    WCS_SIZE_AXIS_X: str = "PLACEHOLDER_UNTIL_VERIFIED"
+    WCS_SIZE_AXIS_Y: str = "PLACEHOLDER_UNTIL_VERIFIED"
 
     # SAM 3.1
     SAM3_CHECKPOINT: Path = Path("models/sam3.1_hiera_large.pt")
@@ -1010,7 +1082,7 @@ git commit -m "feat(jobs): polygon/nodata persistence, bulk validate, claim, sta
 
 **See Spec §5.1 pts 1, 4, 5, 6** — snapping, margin expansion, minimum size, pixel-count via round().
 
-> ⚠ **Spec-internal inconsistency** (verify before merging): Spec §5.1 pt 4 quotes the margin-expansion as "64 m / 128 m / 192 m" for small/medium/large — but those numbers are `2·CENTER_MARGIN·0.2 m` (= the Max-Object-Size from §5.2 table), not `CENTER_MARGIN·0.2 m` (= 32 m / 64 m / 96 m). This plan follows the **§5.2 formula** (`CENTER_MARGIN_PX[preset] * 0.2`) because it is consistent with the Safe-Center geometry and the Center-Keep rule. If the spec author actually intended the larger expansion, change `CENTER_MARGIN_PX` to `{SMALL: 320, MEDIUM: 640, LARGE: 960}` and update the tests in Step 1 accordingly.
+**Resolved design decision:** Margin expansion is `CENTER_MARGIN_PX[preset] * 0.2m` (= 32 m / 64 m / 96 m for small / medium / large). The larger values 64 m / 128 m / 192 m are the max-object diameters (`2 * CENTER_MARGIN`) and are not the download expansion. Spec §5.1 pt 4 has been aligned with this formula.
 
 Split of concerns: this task implements only the pure geometry math; HTTP comes next task.
 
@@ -1183,7 +1255,7 @@ git commit -m "feat(wcs): BBox prep with grid-snap, margin expansion, min-size"
 - Modify: `ki_geodaten/pipeline/wcs_client.py`
 - Test: `tests/pipeline/test_wcs_client.py` (append)
 
-**See Spec §5.1 pts 2, 3, 6, 7, 8** — pagination grid, HTTP with retry, round() for pixels, contiguous edges, BuildVRT.
+**See Spec §5.1 pts 2, 3, 6, 7, 8 and Task 0** — pagination grid, HTTP with retry, round() for pixels, contiguous edges, BuildVRT. Axis labels and WCS version MUST come from verified config values, not hard-coded guesses.
 
 - [ ] **Step 1: Append failing tests**
 
@@ -1252,6 +1324,8 @@ def test_download_dop20_http_success(tmp_path, responses):
         bbox_utm=bbox, preset_center_margin_px=320, out_dir=tmp_path,
         wcs_url="http://example/wcs", coverage_id="cov1",
         max_pixels=4000, origin_x=0.0, origin_y=0.0,
+        wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+        size_axis_x="E", size_axis_y="N",
     )
     assert vrt_path.exists()
     assert vrt_path.suffix == ".vrt"
@@ -1324,24 +1398,26 @@ def _build_session() -> requests.Session:
 
 def _fetch_chunk(
     session: requests.Session, wcs_url: str, coverage_id: str,
-    chunk: ChunkPlan, out_path: Path,
+    chunk: ChunkPlan, out_path: Path, *,
+    wcs_version: str, subset_axis_x: str, subset_axis_y: str,
+    size_axis_x: str, size_axis_y: str,
 ) -> None:
-    """WCS 2.0 GetCoverage; axis order per Spec §15 offene Punkte — verify at first call."""
+    """WCS GetCoverage; axis labels/order are verified in Task 0 and passed via config."""
     w = chunk.width_px()
     h = chunk.height_px()
     params = {
         "service": "WCS",
-        "version": "2.0.1",
+        "version": wcs_version,
         "request": "GetCoverage",
         "coverageId": coverage_id,
         "format": "image/tiff",
         "subset": [
-            f"E({chunk.minx},{chunk.maxx})",
-            f"N({chunk.miny},{chunk.maxy})",
+            f"{subset_axis_x}({chunk.minx},{chunk.maxx})",
+            f"{subset_axis_y}({chunk.miny},{chunk.maxy})",
         ],
         "subsettingcrs": "http://www.opengis.net/def/crs/EPSG/0/25832",
         "outputcrs":    "http://www.opengis.net/def/crs/EPSG/0/25832",
-        "size": [f"E({w})", f"N({h})"],
+        "size": [f"{size_axis_x}({w})", f"{size_axis_y}({h})"],
     }
     try:
         r = session.get(wcs_url, params=params, timeout=(10, 60))
@@ -1357,6 +1433,8 @@ def download_dop20(
     preset_center_margin_px: int, out_dir: Path,
     *, wcs_url: str, coverage_id: str, max_pixels: int,
     origin_x: float, origin_y: float,
+    wcs_version: str, subset_axis_x: str, subset_axis_y: str,
+    size_axis_x: str, size_axis_y: str,
 ) -> Path:
     """Spec §5.1 signature. bbox_utm MUST be the already-prepared download_bbox."""
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1368,7 +1446,12 @@ def download_dop20(
     chunk_files: list[str] = []
     for c in chunks:
         p = out_dir / f"chunk_{c.row}_{c.col}.tif"
-        _fetch_chunk(session, wcs_url, coverage_id, c, p)
+        _fetch_chunk(
+            session, wcs_url, coverage_id, c, p,
+            wcs_version=wcs_version,
+            subset_axis_x=subset_axis_x, subset_axis_y=subset_axis_y,
+            size_axis_x=size_axis_x, size_axis_y=size_axis_y,
+        )
         chunk_files.append(str(p))
     vrt_path = out_dir / "out.vrt"
     vrt = gdal.BuildVRT(str(vrt_path), chunk_files)
@@ -1649,6 +1732,35 @@ def test_iter_tiles_flags_nodata_in_safe_center(tmp_path):
     tiles = list(iter_tiles(p, cfg))
     t = tiles[0]
     assert isinstance(t, NodataTile) or t.nodata_mask[500:520, 500:520].any()
+
+def test_iter_tiles_black_rgb_without_nodata_mask_is_not_nodata(tmp_path):
+    p = tmp_path / "black.tif"
+    with rasterio.open(
+        p, "w", driver="GTiff", width=1024, height=1024, count=3,
+        dtype="uint8", crs="EPSG:25832",
+        transform=from_bounds(0, 0, 204.8, 204.8, 1024, 1024),
+    ) as dst:
+        dst.write(np.zeros((3, 1024, 1024), dtype="uint8"))
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+    tiles = list(iter_tiles(p, cfg))
+    assert not isinstance(tiles[0], NodataTile)
+
+def test_iter_tiles_alpha_mask_marks_nodata(tmp_path):
+    from rasterio.enums import ColorInterp
+    p = tmp_path / "alpha.tif"
+    with rasterio.open(
+        p, "w", driver="GTiff", width=1024, height=1024, count=4,
+        dtype="uint8", crs="EPSG:25832",
+        transform=from_bounds(0, 0, 204.8, 204.8, 1024, 1024),
+    ) as dst:
+        dst.write(np.full((3, 1024, 1024), 128, dtype="uint8"), indexes=[1, 2, 3])
+        alpha = np.full((1024, 1024), 255, dtype="uint8")
+        alpha[500:520, 500:520] = 0
+        dst.write(alpha, 4)
+        dst.colorinterp = (ColorInterp.red, ColorInterp.green, ColorInterp.blue, ColorInterp.alpha)
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+    tiles = list(iter_tiles(p, cfg))
+    assert isinstance(tiles[0], NodataTile)
 ```
 
 - [ ] **Step 2: Run to confirm failure**
@@ -1685,8 +1797,8 @@ def iter_tiles(
                 window = Window(col_off=col_off, row_off=row_off, width=cfg.size, height=cfg.size)
                 tile_affine = src.window_transform(window)
 
-                mask_band1 = src.read_masks(1, window=window, boundless=True, fill_value=0)
-                nodata_mask = mask_band1 == 0
+                dataset_mask = src.dataset_mask(window=window, boundless=True, fill_value=0)
+                nodata_mask = dataset_mask == 0
 
                 if _safe_center_has_nodata(nodata_mask, cfg.center_margin, cfg.size,
                                            safe_center_nodata_threshold):
@@ -1861,9 +1973,35 @@ class Sam3Segmenter:
         if self._tokenizer is None:
             self.load()
         return int(self._tokenizer(prompt, add_special_tokens=True).input_ids.shape[-1])
+
+class Sam3TextTokenCounter:
+    """Tokenizer-only adapter for the FastAPI process.
+
+    This class MUST NOT build or load the SAM vision model. Task 12A replaces
+    the placeholder import with the verified upstream tokenizer-only API.
+    """
+    def __init__(self, checkpoint: Path) -> None:
+        self.checkpoint = checkpoint
+        self._tokenizer = None
+
+    def load(self) -> None:
+        if self._tokenizer is not None:
+            return
+        try:
+            from sam3.text import build_text_tokenizer  # pragma: no cover - verified in Task 12A
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(
+                "SAM3 tokenizer-only API is not verified yet; complete Task 12A"
+            ) from exc
+        self._tokenizer = build_text_tokenizer(str(self.checkpoint))
+
+    def __call__(self, prompt: str) -> int:
+        if self._tokenizer is None:
+            self.load()
+        return int(self._tokenizer(prompt, add_special_tokens=True).input_ids.shape[-1])
 ```
 
-Note: `sam3` API is placeholder (Spec §13 lists `sam3` from `facebookresearch/sam3`). Real signature will be adjusted once the model is installed; adapter is isolated here.
+Note: `sam3` model and tokenizer APIs are placeholders until Task 12A is completed. Do not implement Worker/API integration against these placeholders without first verifying the upstream signatures.
 
 - [ ] **Step 4: Run tests**
 
@@ -1875,6 +2013,90 @@ Expected: PASS.
 ```bash
 git add ki_geodaten/pipeline/segmenter.py tests/pipeline/test_segmenter.py
 git commit -m "feat(segmenter): MaskResult, local NMS, Sam3Segmenter scaffold"
+```
+
+---
+
+## Task 12A: Verify Real SAM 3.1 Adapter API
+
+**Files:**
+- Modify: `ki_geodaten/pipeline/segmenter.py`
+- Test: `tests/pipeline/test_sam3_adapter_smoke.py`
+
+**Must complete before Task 18/21 production wiring.** Task 12 intentionally scaffolds the SAM boundary, but the exact upstream `facebookresearch/sam3` API must be verified in the real environment. This task removes the placeholder risk.
+
+- [ ] **Step 1: Install / expose upstream SAM 3.1 in the target environment**
+
+Verify imports, checkpoint loading, text prompt encoding, and one image prediction against a tiny RGB tile. Record any required environment variables in `README.md`.
+
+- [ ] **Step 2: Replace placeholder imports and normalization**
+
+Update `Sam3Segmenter.load()` and `Sam3Segmenter.predict()` so they convert the actual upstream output into:
+
+```python
+MaskResult(mask=np.ndarray[bool], score=float, box_pixel=(row0, col0, row1, col1))
+```
+
+Required adapter behavior:
+- `mask` is tile-local shape `(1024, 1024)` and boolean.
+- `box_pixel` uses `(row0, col0, row1, col1)` coordinates matching `keep_center_only`.
+- Scores are floats in `[0, 1]`.
+- Raw model outputs are passed through `local_mask_nms`.
+- Device placement never loads a second GPU model in the FastAPI process.
+
+- [ ] **Step 3: Replace `Sam3TextTokenCounter` with verified tokenizer-only loading**
+
+The webserver token counter must load only tokenizer/text-encoder state needed for token counting. It must not instantiate the full vision model or allocate CUDA memory.
+
+- [ ] **Step 4: Add smoke tests**
+
+```python
+# tests/pipeline/test_sam3_adapter_smoke.py
+import os
+import pytest
+
+pytest.importorskip("sam3")
+
+def test_sam3_token_counter_does_not_require_cuda():
+    from ki_geodaten.pipeline.segmenter import Sam3TextTokenCounter
+    checkpoint = os.environ.get("SAM3_CHECKPOINT")
+    if not checkpoint:
+        pytest.skip("SAM3_CHECKPOINT not set")
+    counter = Sam3TextTokenCounter(checkpoint)
+    assert counter("building") > 0
+
+def test_sam3_segmenter_smoke_prediction_shape():
+    import numpy as np
+    from affine import Affine
+    from ki_geodaten.models import TilePreset
+    from ki_geodaten.pipeline.tiler import Tile, TileConfig
+    from ki_geodaten.pipeline.segmenter import Sam3Segmenter, MaskResult
+
+    checkpoint = os.environ.get("SAM3_CHECKPOINT")
+    if not checkpoint:
+        pytest.skip("SAM3_CHECKPOINT not set")
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+    tile = Tile(
+        array=np.zeros((1024, 1024, 3), dtype=np.uint8),
+        pixel_origin=(0, 0), size=1024, center_margin=cfg.center_margin,
+        affine=Affine(0.2, 0, 0, 0, -0.2, 204.8),
+        tile_row=0, tile_col=0,
+        nodata_mask=np.zeros((1024, 1024), dtype=bool),
+    )
+    seg = Sam3Segmenter(checkpoint)
+    out = seg.predict(tile, "building")
+    assert isinstance(out, list)
+    for item in out:
+        assert isinstance(item, MaskResult)
+        assert item.mask.shape == (1024, 1024)
+        assert item.mask.dtype == bool
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add ki_geodaten/pipeline/segmenter.py tests/pipeline/test_sam3_adapter_smoke.py README.md
+git commit -m "feat(segmenter): verify real SAM 3.1 adapter and tokenizer-only counter"
 ```
 
 ---
@@ -2355,7 +2577,7 @@ git commit -m "feat(exporter): two-layer GPKG with AOI clip, overwrite, and empt
 
 **See Spec §8** — transform EPSG:25832 → EPSG:4326, `shapely.set_precision(grid_size=1e-6)`, AOI clip uses `bbox_utm_snapped` in UTM **before** transform.
 
-This module is intended to run inside a `ProcessPoolExecutor` (Task 20). No HTTP state here; only pure serialization.
+This module is intended to run inside a `ProcessPoolExecutor` (Task 21). No HTTP state here; only pure serialization.
 
 - [ ] **Step 1: Write failing test**
 
@@ -2697,6 +2919,8 @@ def test_orchestrator_happy_path_marks_ready(tmp_path, monkeypatch):
 
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
+            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
@@ -2725,6 +2949,8 @@ def test_orchestrator_records_oom_as_nodata(tmp_path, monkeypatch):
 
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
+            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
@@ -2744,6 +2970,8 @@ def test_orchestrator_records_inference_error_as_nodata(tmp_path, monkeypatch):
 
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
+            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
@@ -2761,6 +2989,8 @@ def test_orchestrator_records_nodata_tile_without_invoking_segmenter(tmp_path, m
 
     run_job(db, job_id="j1", segmenter=seg, data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
+            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
@@ -2776,6 +3006,8 @@ def test_orchestrator_catches_download_error_marks_failed(tmp_path, monkeypatch)
 
     run_job(db, job_id="j1", segmenter=_StubSegmenter([]), data_root=tmp_path,
             wcs_url="", coverage_id="", max_pixels=4000,
+            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0, min_polygon_area_m2=0.01,
             safe_center_nodata_threshold=0.0)
 
@@ -2866,6 +3098,8 @@ def _persist_safe_center_nodata(
 def run_job(
     db_path: Path, *, job_id: str, segmenter, data_root: Path,
     wcs_url: str, coverage_id: str, max_pixels: int,
+    wcs_version: str, subset_axis_x: str, subset_axis_y: str,
+    size_axis_x: str, size_axis_y: str,
     origin_x: float, origin_y: float, min_polygon_area_m2: float,
     safe_center_nodata_threshold: float,
 ) -> None:
@@ -2894,6 +3128,9 @@ def run_job(
             prepared.download_bbox, preset_center_margin_px=cfg.center_margin,
             out_dir=out_dir, wcs_url=wcs_url, coverage_id=coverage_id,
             max_pixels=max_pixels, origin_x=origin_x, origin_y=origin_y,
+            wcs_version=wcs_version,
+            subset_axis_x=subset_axis_x, subset_axis_y=subset_axis_y,
+            size_axis_x=size_axis_x, size_axis_y=size_axis_y,
         )
         update_status(db_path, job_id, JobStatus.INFERRING, dop_vrt_path=str(vrt_path))
 
@@ -3040,6 +3277,8 @@ def test_run_forever_exits_after_max_jobs(tmp_path, monkeypatch):
         db_path=db, data_root=tmp_path,
         segmenter_factory=lambda: _StubSegmenter(),
         wcs_url="", coverage_id="", max_pixels=4000,
+        wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+        size_axis_x="E", size_axis_y="N",
         origin_x=0.0, origin_y=0.0,
         min_polygon_area_m2=1.0, safe_center_nodata_threshold=0.0,
         max_jobs=2, poll_interval=0.01, idle_exit_after=2,
@@ -3095,6 +3334,8 @@ def run_forever(
     *, db_path: Path, data_root: Path,
     segmenter_factory: Callable[[], object],
     wcs_url: str, coverage_id: str, max_pixels: int,
+    wcs_version: str, subset_axis_x: str, subset_axis_y: str,
+    size_axis_x: str, size_axis_y: str,
     origin_x: float, origin_y: float,
     min_polygon_area_m2: float, safe_center_nodata_threshold: float,
     max_jobs: int, poll_interval: float,
@@ -3121,6 +3362,9 @@ def run_forever(
                 data_root=data_root,
                 wcs_url=wcs_url, coverage_id=coverage_id,
                 max_pixels=max_pixels,
+                wcs_version=wcs_version,
+                subset_axis_x=subset_axis_x, subset_axis_y=subset_axis_y,
+                size_axis_x=size_axis_x, size_axis_y=size_axis_y,
                 origin_x=origin_x, origin_y=origin_y,
                 min_polygon_area_m2=min_polygon_area_m2,
                 safe_center_nodata_threshold=safe_center_nodata_threshold,
@@ -3145,6 +3389,11 @@ def main() -> None:   # pragma: no cover
         ),
         wcs_url=settings.WCS_URL, coverage_id=settings.WCS_COVERAGE_ID,
         max_pixels=settings.WCS_MAX_PIXELS,
+        wcs_version=settings.WCS_VERSION,
+        subset_axis_x=settings.WCS_SUBSET_AXIS_X,
+        subset_axis_y=settings.WCS_SUBSET_AXIS_Y,
+        size_axis_x=settings.WCS_SIZE_AXIS_X,
+        size_axis_y=settings.WCS_SIZE_AXIS_Y,
         origin_x=settings.WCS_GRID_ORIGIN_X, origin_y=settings.WCS_GRID_ORIGIN_Y,
         min_polygon_area_m2=settings.MIN_POLYGON_AREA_M2,
         safe_center_nodata_threshold=settings.SAFE_CENTER_NODATA_THRESHOLD,
@@ -3320,7 +3569,7 @@ git commit -m "feat(jobs): retention cleanup for FAILED/EXPORTED jobs"
 
 **Injection hooks:** `create_app(executor_factory=..., token_counter=...)` both accept optional overrides so tests can substitute a `ThreadPoolExecutor` (avoiding slow subprocess spawn on every test) and a deterministic tokenizer stub. Production leaves them at defaults.
 
-**Token-counter in production:** per Spec §5.3/§8 the limit must be checked on the **real, templatized encoder sequence**, not whitespace-split chars. The app process does NOT hold SAM on GPU, but can load just the text tokenizer on CPU (a few MB). The lifespan below wires this: if `SAM3_CHECKPOINT` is available, it loads the tokenizer via `Sam3Segmenter(..., device="cpu").load()` and exposes `encoder_token_count` as the production counter. If loading fails (e.g. sam3 not installed yet during development), it falls back to whitespace split **and logs a warning** — *never* silent, because the spec invariant is that an over-long prompt must reach HTTP 422.
+**Token-counter in production:** per Spec §5.3/§8 the limit must be checked on the **real, templatized encoder sequence**, not whitespace-split chars. The app process must not build the SAM vision model and must not allocate CUDA memory. It uses `Sam3TextTokenCounter` from Task 12A, which loads only tokenizer/text-encoding state. If loading fails (e.g. sam3 not installed yet during development), it falls back to whitespace split **and logs a warning** — *never* silent, because the spec invariant is that an over-long prompt must reach HTTP 422.
 
 - [ ] **Step 1: Write failing test**
 
@@ -3415,10 +3664,10 @@ def _default_token_counter(settings: Settings) -> TokenCounter:
     Prefer loading the real SAM text tokenizer on CPU. Fall back with a loud
     warning — we must NEVER silently under-count tokens."""
     try:
-        from ki_geodaten.pipeline.segmenter import Sam3Segmenter
-        seg = Sam3Segmenter(settings.SAM3_CHECKPOINT, device="cpu")
-        seg.load()
-        return seg.encoder_token_count
+        from ki_geodaten.pipeline.segmenter import Sam3TextTokenCounter
+        counter = Sam3TextTokenCounter(settings.SAM3_CHECKPOINT)
+        counter.load()
+        return counter
     except Exception as exc:   # noqa: BLE001 — covers missing sam3 in dev
         logger.warning(
             "Falling back to whitespace-split token counter "
@@ -3836,6 +4085,8 @@ git commit -m "feat(api): GET /jobs, /jobs/{id}, /jobs/{id}/export.gpkg"
 
 **See Spec §8** — status gate (`READY_FOR_REVIEW` or `EXPORTED` only), `executemany`, increments `validation_revision`.
 
+**Critical:** declare this endpoint as `def`, not `async def`. It performs synchronous SQLite writes and can wait on WAL writer locks; FastAPI should run it in the threadpool so the event loop remains responsive to status polling and GeoJSON requests.
+
 - [ ] **Step 1: Append failing tests**
 
 ```python
@@ -3905,7 +4156,7 @@ from ki_geodaten.jobs.store import validate_bulk
 _REVIEWABLE = {"READY_FOR_REVIEW", "EXPORTED"}
 
 @router.post("/jobs/{job_id}/polygons/validate_bulk")
-async def validate_bulk_endpoint(
+def validate_bulk_endpoint(
     job_id: str, req: ValidateBulkRequest, request: Request,
 ):
     job = get_job(request.app.state.db_path, job_id)
@@ -3945,7 +4196,7 @@ git commit -m "feat(api): validate_bulk with status gate and revision bump"
 - Modify: `ki_geodaten/app/routes/jobs.py` (append)
 - Test: `tests/app/test_routes_jobs.py` (append)
 
-**See Spec §8** — module-wide `threading.Lock` around `export_two_layer_gpkg` (GDAL/Fiona are not thread-safe). Re-export allowed from `EXPORTED`. On success: `status='EXPORTED'`, `exported_revision = validation_revision`, rmtree `data/dop/{job_id}`.
+**See Spec §8** — module-wide `threading.Lock` around `export_two_layer_gpkg` (GDAL/Fiona are not thread-safe). Re-export allowed from `EXPORTED`. On success: `status='EXPORTED'`, `exported_revision = validation_revision`, `finished_at` is refreshed to the export time for retention semantics, and `data/dop/{job_id}` is removed.
 
 **Critical:** this endpoint is declared as `def` (not `async def`). FastAPI routes sync functions to its threadpool — essential, because `export_two_layer_gpkg` holds the GIL-releasing GDAL/Fiona calls for multiple seconds. If it were `async def`, the blocking work would freeze the event loop and block ALL other requests (status polls, GeoJSON fetches) until export finishes. The `threading.Lock` then correctly serializes concurrent threadpool workers.
 
@@ -4109,6 +4360,7 @@ def export_job(job_id: str, request: Request):
             db, job_id, JobStatus.EXPORTED,
             gpkg_path=str(out_path),
             exported_revision=int(job["validation_revision"]),
+            set_finished=True,
         )
 
     # Disk-Hygiene after successful export (Spec §7)
@@ -4495,8 +4747,9 @@ input, select, button { width: 100%; padding: 6px; box-sizing: border-box; }
     jobList.innerHTML = '';
     for (const j of jobs) {
       const li = document.createElement('li');
+      const processed = (j.tile_completed || 0) + (j.tile_failed || 0);
       li.innerHTML = `<span class="badge badge-${j.status}">${j.status}</span> ${j.prompt}
-                     <small>${(j.tile_completed||0)}/${j.tile_total||'?'}</small>`;
+                     <small>${processed}/${j.tile_total||'?'}</small>`;
       li.onclick = () => openJob(j.id);
       jobList.appendChild(li);
     }
@@ -4543,8 +4796,9 @@ input, select, button { width: 100%; padding: 6px; box-sizing: border-box; }
   }
 
   function renderStatus(job) {
+    const processed = (job.tile_completed || 0) + (job.tile_failed || 0);
     statusDiv.innerHTML =
-      `<b>${job.status}</b> &mdash; ${job.tile_completed||0}/${job.tile_total||'?'}` +
+      `<b>${job.status}</b> &mdash; ${processed}/${job.tile_total||'?'}` +
       (job.error_reason ? ` <em>(${job.error_reason})</em>` : '');
     reviewPanel.hidden = !['READY_FOR_REVIEW', 'EXPORTED'].includes(job.status);
     if (!reviewPanel.hidden) {
@@ -4821,6 +5075,8 @@ def test_end_to_end(tmp_path, monkeypatch):
             db_path=app.state.db_path, data_root=app.state.data_root,
             segmenter_factory=_StubSegmenter,
             wcs_url="", coverage_id="", max_pixels=4000,
+            wcs_version="2.0.1", subset_axis_x="E", subset_axis_y="N",
+            size_axis_x="E", size_axis_y="N",
             origin_x=0.0, origin_y=0.0,
             min_polygon_area_m2=0.01, safe_center_nodata_threshold=0.0,
             max_jobs=1, poll_interval=0.01, idle_exit_after=1,
@@ -4908,12 +5164,18 @@ Copy `.env.example` → `.env`, fill in verified values:
 ```
 WCS_URL=https://geoservices.bayern.de/wcs/v2/dop20
 WCS_COVERAGE_ID=by_dop20rgb
+WCS_VERSION=2.0.1
 WCS_GRID_ORIGIN_X=<from GetCapabilities>
 WCS_GRID_ORIGIN_Y=<from GetCapabilities>
+WCS_SUBSET_AXIS_X=<from GetCapabilities, e.g. E>
+WCS_SUBSET_AXIS_Y=<from GetCapabilities, e.g. N>
+WCS_SIZE_AXIS_X=<from GetCapabilities, e.g. E>
+WCS_SIZE_AXIS_Y=<from GetCapabilities, e.g. N>
 ```
 
-**Before first run:** verify WCS axis order, origin, and max pixel count via
-a manual `GetCapabilities` request (Spec §15).
+**Before first run:** complete Task 0 / `docs/wcs-verification.md` and verify
+WCS axis order, origin, and max pixel count via `GetCapabilities` /
+`DescribeCoverage` (Spec §15).
 
 ## Run
 
@@ -4967,12 +5229,14 @@ Before marking the plan done, verify:
 - [ ] Every Spec section §5.1–§12 has at least one implementing task.
 - [ ] `validation_revision` is written ONLY by `validate_bulk`; never by export.
 - [ ] `exported_revision` is written ONLY by the export endpoint.
+- [ ] Task 0 WCS verification is complete and `config.py` WCS defaults match `docs/wcs-verification.md`.
 - [ ] `nodata_regions.geometry_wkb` always stores the **safe-center** polygon (size-2·margin), never the full tile.
 - [ ] `bbox_utm_snapped` is the unexpanded user AOI; the download bbox is only used at download time.
 - [ ] GeoJSON responses and GPKG are both clipped to `bbox_utm_snapped` (Clip-Window-Semantik).
 - [ ] `masks_to_polygons` uses `connectivity=8` and excludes `value != 1`.
 - [ ] Worker never holds a write transaction longer than one tile.
 - [ ] Export route is wrapped by `app.state.export_lock`.
+- [ ] Export route refreshes `finished_at` when setting `EXPORTED`, so retention starts at export time.
 - [ ] `validate_bulk` uses `executemany`, never variadic `VALUES(...)`.
 - [ ] GeoJSON precision ≤ 1e-6° (set via `shapely.set_precision`).
 - [ ] Bayern fence AND UTM-area check are both enforced in `POST /jobs`.
@@ -4989,16 +5253,18 @@ Before marking the plan done, verify:
 - [ ] Export route unpickles via module-level `update_status` import (no in-function `from ... import ... as _us` shadowing).
 - [ ] `_job_view` returns `bbox_wgs84` as a parsed **array**, not a JSON string.
 - [ ] Frontend styles polygons via native Leaflet `style` options (color / fillColor / dashArray), NOT CSS classes — `L.canvas()` ignores per-feature className.
+- [ ] Frontend progress displays `(tile_completed + tile_failed) / tile_total`, not only successful tiles.
 - [ ] Frontend `openJob(id)` flushes to the PREVIOUS `currentJobId` before switching, then clears `pendingUpdates`, then calls `hydratePending(id)` so session-persisted updates are recovered.
 - [ ] Frontend `flushValidations()` only removes entries from `pendingUpdates` AFTER a successful POST; on network/server error the batch stays in memory and is re-persisted for retry.
 
 **Production hardening**
-- [ ] `app.state.token_counter` uses the **real SAM text tokenizer** loaded on CPU in production; the whitespace-split fallback logs a WARNING (never silent).
+- [ ] `app.state.token_counter` uses the **real SAM text tokenizer only** in production; it never builds the SAM vision model or allocates CUDA memory. The whitespace-split fallback logs a WARNING (never silent).
+- [ ] Task 12A verified the actual upstream SAM 3.1 prediction and tokenizer APIs.
 - [ ] `create_app(executor_factory=..., token_counter=...)` accepts overrides so tests can inject a `ThreadPoolExecutor` and a deterministic token counter — production uses the defaults.
 - [ ] `scripts/run-worker.sh` traps SIGINT/SIGTERM so a single Ctrl-C stops the supervisor cleanly.
 - [ ] End-to-end test uses `pytest.importorskip("osgeo")` / `pytest.importorskip("fiona")` so the suite degrades gracefully when GDAL/Fiona aren't installed.
 
-**Spec note — must be resolved before implementation**
-- [ ] Margin-expansion semantics: plan follows §5.2 (CENTER_MARGIN_PX × 0.2 m = 32/64/96 m). §5.1 pt 4 quotes conflicting numbers (64/128/192 m). Confirm with spec author which value is authoritative before coding Task 7 — if the larger values are intended, double `CENTER_MARGIN_PX` and rebase Task 7 tests.
+**Resolved spec decision**
+- [ ] Margin-expansion semantics are fixed: download expands by `CENTER_MARGIN_PX × 0.2 m` = 32/64/96 m. Max object diameter remains `2 × CENTER_MARGIN_PX × 0.2 m` = 64/128/192 m.
 
 If a checkbox fails, fix inline and re-run the relevant test.

@@ -137,7 +137,7 @@ Jede Stufe ist ein Modul in `pipeline/` mit klar typisierter Ein-/Ausgabe, isoli
 
 3. **Harte Timeouts:** Jeder HTTP-Request mit `timeout=(10, 60)` (connect / read). Retries via `urllib3.Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504])` → exponentielle Backoff 2–8 s. Nach endgültigem Fehlschlag: `WCSError`-Exception, Job `FAILED` mit `error_reason='WCS_TIMEOUT'`.
 
-4. **Margin-Expansion (Edge-Protection):** Nach dem Grid-Snapping wird die BBox in alle vier Richtungen um `CENTER_MARGIN × 0.2 m` erweitert (64 m für small, 128 m für medium, 192 m für large — passend zum `tile_preset` des Jobs). **Warum zwingend:** Der BBox-Center-Filter in 5.4 verwirft Polygone, deren Mittelpunkt im Rand-Streifen liegt. Zwischen Kacheln ist das korrekt — dort übernimmt der Nachbar. Am absoluten VRT-Rand gibt es aber keinen Nachbarn. Ohne diese Expansion wäre die äußere `CENTER_MARGIN`-Zone der vom Nutzer angeforderten Fläche systematisch leer — das verfälscht jede ALKIS-Evaluation. Mit der Expansion liegt die angeforderte Fläche vollständig in Safe-Zentren. Der Download wird etwas größer (für medium-Preset bei 2×2 km BBox: 2.256×2.256 km), bleibt aber unkritisch.
+4. **Margin-Expansion (Edge-Protection):** Nach dem Grid-Snapping wird die BBox in alle vier Richtungen um `CENTER_MARGIN × 0.2 m` erweitert (32 m für small, 64 m für medium, 96 m für large — passend zum `tile_preset` des Jobs). **Warum zwingend:** Der BBox-Center-Filter in 5.4 verwirft Polygone, deren Mittelpunkt im Rand-Streifen liegt. Zwischen Kacheln ist das korrekt — dort übernimmt der Nachbar. Am absoluten VRT-Rand gibt es aber keinen Nachbarn. Ohne diese Expansion wäre die äußere `CENTER_MARGIN`-Zone der vom Nutzer angeforderten Fläche systematisch leer — das verfälscht jede ALKIS-Evaluation. Mit der Expansion liegt die angeforderte Fläche vollständig in Safe-Zentren. Die maximal abbildbare Objektgröße bleibt davon getrennt `2 × CENTER_MARGIN × 0.2 m` (64 m / 128 m / 192 m für small / medium / large). Der Download wird etwas größer (für medium-Preset bei 2×2 km BBox: 2.128×2.128 km), bleibt aber unkritisch.
 
    **Wichtig für alle Downstream-Schritte:** Die expandierte Download-BBox ist ein **internes Hilfskonstrukt**. `jobs.bbox_utm_snapped` bleibt die **unexpandierte, vom Nutzer angeforderte AOI** nach Transform + Grid-Snap. Alle user-sichtbaren Ergebnisse (GeoJSON, Export, Metrik-Inputs) werden später wieder auf genau diese AOI zurückgeführt.
 
@@ -726,9 +726,14 @@ Fokus auf `pipeline/`-Module (reine Funktionen, gut isolierbar). Keine Tests fü
 # WCS — beim ersten GetCapabilities-Call verifizieren
 WCS_URL: str              = "PLACEHOLDER_UNTIL_VERIFIED"   # z.B. https://geoservices.bayern.de/wcs/v2/dop20
 WCS_COVERAGE_ID: str      = "PLACEHOLDER_UNTIL_VERIFIED"
+WCS_VERSION: str          = "2.0.1"
 WCS_MAX_PIXELS: int       = 4000
 WCS_GRID_ORIGIN_X: float  = 0.0   # nach GetCapabilities verifizieren
 WCS_GRID_ORIGIN_Y: float  = 0.0   # nach GetCapabilities verifizieren
+WCS_SUBSET_AXIS_X: str    = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
+WCS_SUBSET_AXIS_Y: str    = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
+WCS_SIZE_AXIS_X: str      = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
+WCS_SIZE_AXIS_Y: str      = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
 
 # SAM 3.1
 SAM3_CHECKPOINT: Path     = Path("models/sam3.1_hiera_large.pt")
