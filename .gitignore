@@ -7,3 +7,9 @@ data/*.db*
 models/*.pt
 .env
 .pytest_cache/
+.pytest_tmp/
+pytest-cache-files-*/
+ki_geodaten.egg-info/
+data/logs/
+data/pytest_tmp/
+data/test_tmp/

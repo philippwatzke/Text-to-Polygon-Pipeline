@@ -1,0 +1,147 @@
+html, body, #app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: Arial, sans-serif;
+}
+
+#app {
+  display: grid;
+  grid-template-columns: 320px 1fr;
+}
+
+#sidebar {
+  box-sizing: border-box;
+  padding: 14px;
+  border-right: 1px solid #d0d5dd;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+#sidebar h1 {
+  font-size: 20px;
+  margin: 0 0 8px;
+}
+
+#prompt {
+  min-height: 72px;
+  resize: vertical;
+}
+
+button, select, textarea, input {
+  font: inherit;
+}
+
+#review-panel,
+#compare-panel {
+  border-top: 1px solid #e5e7eb;
+  border-bottom: 1px solid #e5e7eb;
+  padding: 10px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.panel-row,
+.checkbox-row,
+.field-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.checkbox-row {
+  justify-content: flex-start;
+}
+
+#score-filter {
+  width: 100%;
+}
+
+#score-value {
+  font-variant-numeric: tabular-nums;
+}
+
+#review-stats {
+  color: #475467;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+#missed-estimate {
+  box-sizing: border-box;
+  width: 88px;
+}
+
+#compare-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.compare-card {
+  border: 1px solid #d0d5dd;
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.compare-card header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.compare-title {
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.compare-subtitle {
+  color: #667085;
+}
+
+.compare-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 10px;
+}
+
+.compare-grid span:nth-child(odd) {
+  color: #667085;
+}
+
+#map {
+  min-width: 0;
+}
+
+#jobs {
+  overflow: auto;
+}
+
+.job {
+  border-top: 1px solid #e5e7eb;
+  padding: 8px 0;
+  cursor: pointer;
+}
+
+@media (max-width: 760px) {
+  #app {
+    grid-template-columns: 1fr;
+    grid-template-rows: 260px 1fr;
+  }
+
+  #sidebar {
+    border-right: 0;
+    border-bottom: 1px solid #d0d5dd;
+  }
+}

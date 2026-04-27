@@ -62,3 +62,6 @@ class ValidationUpdate(BaseModel):
 
 class ValidateBulkRequest(BaseModel):
     updates: list[ValidationUpdate]
+
+class MissedEstimateRequest(BaseModel):
+    missed_estimate: int | None = Field(default=None, ge=0)

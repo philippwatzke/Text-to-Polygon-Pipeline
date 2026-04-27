@@ -1,0 +1,98 @@
+from __future__ import annotations
+
+import json
+from typing import Iterable
+
+import shapely
+from shapely.geometry import box, mapping
+from shapely.ops import transform as shapely_transform
+from shapely.validation import make_valid
+from shapely.wkb import loads as wkb_loads
+
+from ki_geodaten.pipeline.geo_utils import transformer_25832_to_4326
+from ki_geodaten.pipeline.merger import extract_polygons
+
+_PRECISION_DEG = 1e-6
+
+
+def _transform_to_4326(geom):
+    transformer = transformer_25832_to_4326()
+    return shapely_transform(lambda x, y, z=None: transformer.transform(x, y), geom)
+
+
+def _clip_transform_precision(geom, aoi_utm_polygon):
+    clipped = geom.intersection(aoi_utm_polygon)
+    if clipped.is_empty:
+        return []
+    clipped = make_valid(clipped)
+    out = []
+    for polygon in extract_polygons(clipped):
+        transformed = _transform_to_4326(polygon)
+        rounded = shapely.set_precision(transformed, grid_size=_PRECISION_DEG)
+        rounded = make_valid(rounded)
+        out.extend(extract_polygons(rounded))
+    return out
+
+
+def _feature_collection(features: list[dict]) -> dict:
+    return {"type": "FeatureCollection", "features": features}
+
+
+def build_polygons_feature_collection(
+    rows: Iterable[dict],
+    *,
+    aoi_utm: tuple[float, float, float, float],
+) -> dict:
+    aoi = box(*aoi_utm)
+    features: list[dict] = []
+    for row in rows:
+        geom = wkb_loads(row["geometry_wkb"])
+        for transformed in _clip_transform_precision(geom, aoi):
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(transformed),
+                    "properties": {
+                        "id": row["id"],
+                        "score": row["score"],
+                        "validation": row["validation"],
+                    },
+                }
+            )
+    return _feature_collection(features)
+
+
+def build_polygons_geojson(
+    rows: Iterable[dict],
+    *,
+    aoi_utm: tuple[float, float, float, float],
+) -> str:
+    return json.dumps(build_polygons_feature_collection(rows, aoi_utm=aoi_utm))
+
+
+def build_nodata_feature_collection(
+    rows: Iterable[dict],
+    *,
+    aoi_utm: tuple[float, float, float, float],
+) -> dict:
+    aoi = box(*aoi_utm)
+    features: list[dict] = []
+    for row in rows:
+        geom = wkb_loads(row["geometry_wkb"])
+        for transformed in _clip_transform_precision(geom, aoi):
+            features.append(
+                {
+                    "type": "Feature",
+                    "geometry": mapping(transformed),
+                    "properties": {"reason": row["reason"]},
+                }
+            )
+    return _feature_collection(features)
+
+
+def build_nodata_geojson(
+    rows: Iterable[dict],
+    *,
+    aoi_utm: tuple[float, float, float, float],
+) -> str:
+    return json.dumps(build_nodata_feature_collection(rows, aoi_utm=aoi_utm))

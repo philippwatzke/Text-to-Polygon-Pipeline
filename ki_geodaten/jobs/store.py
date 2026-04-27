@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     tile_failed       INTEGER NOT NULL DEFAULT 0,
     validation_revision INTEGER NOT NULL DEFAULT 0,
     exported_revision   INTEGER,
+    missed_estimate   INTEGER,
+    run_metadata      TEXT,
     created_at        TEXT NOT NULL,
     started_at        TEXT,
     finished_at       TEXT
@@ -79,6 +81,14 @@ def init_schema(db_path: Path) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with connect(db_path) as conn:
         conn.executescript(SCHEMA)
+        cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(jobs)").fetchall()
+        }
+        if "missed_estimate" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN missed_estimate INTEGER")
+        if "run_metadata" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN run_metadata TEXT")
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -87,13 +97,23 @@ def insert_job(
     db_path: Path, *, job_id: str, prompt: str,
     bbox_wgs84: list[float], bbox_utm_snapped: list[float],
     tile_preset: TilePreset,
+    run_metadata: dict | None = None,
 ) -> None:
     with connect(db_path) as conn:
         conn.execute(
-            "INSERT INTO jobs(id,prompt,bbox_wgs84,bbox_utm_snapped,tile_preset,status,created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (job_id, prompt, json.dumps(bbox_wgs84), json.dumps(bbox_utm_snapped),
-             str(tile_preset), JobStatus.PENDING, _utc_iso()),
+            "INSERT INTO jobs(id,prompt,bbox_wgs84,bbox_utm_snapped,tile_preset,"
+            "status,run_metadata,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (
+                job_id,
+                prompt,
+                json.dumps(bbox_wgs84),
+                json.dumps(bbox_utm_snapped),
+                str(tile_preset),
+                JobStatus.PENDING,
+                json.dumps(run_metadata) if run_metadata is not None else None,
+                _utc_iso(),
+            ),
         )
 
 def get_job(db_path: Path, job_id: str) -> dict | None:
@@ -209,6 +229,83 @@ def validate_bulk(db_path: Path, job_id: str, updates: list[dict]) -> int:
         )
         conn.execute("COMMIT")
     return max(updated, 0)
+
+def update_missed_estimate(db_path: Path, job_id: str, missed_estimate: int | None) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET missed_estimate = ? WHERE id = ?",
+            (missed_estimate, job_id),
+        )
+
+def get_job_summary(db_path: Path, job_id: str) -> dict | None:
+    with connect(db_path) as conn:
+        job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
+        if job is None:
+            return None
+        counts = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS total,
+                SUM(CASE WHEN validation = 'ACCEPTED' THEN 1 ELSE 0 END) AS accepted,
+                SUM(CASE WHEN validation = 'REJECTED' THEN 1 ELSE 0 END) AS rejected,
+                MIN(score) AS min_score,
+                AVG(score) AS avg_score,
+                MAX(score) AS max_score
+            FROM polygons
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        buckets = conn.execute(
+            """
+            SELECT
+                SUM(CASE WHEN score < 0.35 THEN 1 ELSE 0 END) AS lt_035,
+                SUM(CASE WHEN score >= 0.35 AND score < 0.5 THEN 1 ELSE 0 END) AS gte_035_lt_05,
+                SUM(CASE WHEN score >= 0.5 AND score < 0.7 THEN 1 ELSE 0 END) AS gte_05_lt_07,
+                SUM(CASE WHEN score >= 0.7 THEN 1 ELSE 0 END) AS gte_07
+            FROM polygons
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+
+    total = int(counts["total"] or 0)
+    accepted = int(counts["accepted"] or 0)
+    rejected = int(counts["rejected"] or 0)
+    missed = job["missed_estimate"]
+    recall_estimate = None
+    if missed is not None and accepted + int(missed) > 0:
+        recall_estimate = accepted / (accepted + int(missed))
+    precision_review = accepted / total if total else None
+    return {
+        "id": job["id"],
+        "prompt": job["prompt"],
+        "tile_preset": job["tile_preset"],
+        "status": job["status"],
+        "tile_total": job["tile_total"],
+        "tile_completed": job["tile_completed"],
+        "tile_failed": job["tile_failed"],
+        "validation_revision": job["validation_revision"],
+        "exported_revision": job["exported_revision"],
+        "export_stale": job["exported_revision"] is None
+        or job["exported_revision"] < job["validation_revision"],
+        "created_at": job["created_at"],
+        "missed_estimate": missed,
+        "total": total,
+        "accepted": accepted,
+        "rejected": rejected,
+        "precision_review": precision_review,
+        "recall_estimate": recall_estimate,
+        "min_score": counts["min_score"],
+        "avg_score": counts["avg_score"],
+        "max_score": counts["max_score"],
+        "score_buckets": {
+            "lt_035": int(buckets["lt_035"] or 0),
+            "gte_035_lt_05": int(buckets["gte_035_lt_05"] or 0),
+            "gte_05_lt_07": int(buckets["gte_05_lt_07"] or 0),
+            "gte_07": int(buckets["gte_07"] or 0),
+        },
+    }
 
 def list_jobs(db_path: Path) -> list[dict]:
     with connect(db_path) as conn:

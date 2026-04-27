@@ -11,6 +11,7 @@ def test_settings_defaults():
     assert s.WMS_MAX_PIXELS == 6000
     assert s.WMS_GRID_ORIGIN_X == 0.0
     assert s.WMS_GRID_ORIGIN_Y == 0.0
+    assert s.SAM3_MODEL_ID == "facebook/sam3"
     assert s.TILE_SIZE == 1024
     assert s.DEFAULT_TILE_PRESET == "medium"
     assert s.MIN_POLYGON_AREA_M2 == 1.0

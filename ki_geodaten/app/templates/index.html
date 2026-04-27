@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Text-to-Polygon</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
+  <link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+  <main id="app">
+    <aside id="sidebar">
+      <h1>Text-to-Polygon</h1>
+      <textarea id="prompt" placeholder="building"></textarea>
+      <select id="preset">
+        <option value="small">small</option>
+        <option value="medium" selected>medium</option>
+        <option value="large">large</option>
+      </select>
+      <button id="submit" type="button">Start</button>
+      <button id="export" type="button">Export</button>
+      <section id="review-panel" aria-label="Review filters">
+        <div class="panel-row">
+          <label for="score-filter">Min score</label>
+          <output id="score-value" for="score-filter">0.00</output>
+        </div>
+        <input id="score-filter" type="range" min="0" max="1" step="0.05" value="0">
+        <label class="checkbox-row">
+          <input id="show-rejected" type="checkbox" checked>
+          <span>Show rejected</span>
+        </label>
+        <button id="reject-below-score" type="button">Reject below score</button>
+        <div id="review-stats"></div>
+      </section>
+      <section id="compare-panel" aria-label="Job comparison">
+        <div class="panel-row">
+          <strong>Compare</strong>
+          <button id="add-compare" type="button">Add job</button>
+        </div>
+        <label class="field-row" for="missed-estimate">
+          <span>Missed estimate</span>
+          <input id="missed-estimate" type="number" min="0" step="1" placeholder="0">
+        </label>
+        <button id="save-missed-estimate" type="button">Save estimate</button>
+        <div id="compare-list"></div>
+      </section>
+      <div id="status"></div>
+      <div id="jobs"></div>
+    </aside>
+    <div id="map"></div>
+  </main>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>
+  <script src="/static/app.js"></script>
+</body>
+</html>

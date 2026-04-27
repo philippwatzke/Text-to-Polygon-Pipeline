@@ -1,7 +1,15 @@
 import pytest
 import sqlite3
 from pathlib import Path
-from ki_geodaten.jobs.store import connect, init_schema, insert_job, get_job, update_status
+from ki_geodaten.jobs.store import (
+    connect,
+    get_job,
+    get_job_summary,
+    init_schema,
+    insert_job,
+    update_missed_estimate,
+    update_status,
+)
 from ki_geodaten.models import JobStatus, TilePreset
 
 def test_init_schema_creates_tables(tmp_path: Path):
@@ -15,6 +23,30 @@ def test_init_schema_creates_tables(tmp_path: Path):
     assert "jobs" in names
     assert "polygons" in names
     assert "nodata_regions" in names
+
+def test_init_schema_adds_missed_estimate_to_existing_jobs_table(tmp_path: Path):
+    db = tmp_path / "t.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            """
+            CREATE TABLE jobs (
+                id TEXT PRIMARY KEY,
+                prompt TEXT NOT NULL,
+                bbox_wgs84 TEXT NOT NULL,
+                bbox_utm_snapped TEXT NOT NULL,
+                tile_preset TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
+    init_schema(db)
+
+    with connect(db) as conn:
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
+    assert "missed_estimate" in cols
 
 def test_connect_sets_wal_mode(tmp_path):
     db = tmp_path / "t.db"
@@ -103,6 +135,40 @@ def test_validate_bulk_updates_revision_and_ignores_unknown_pids(tmp_path):
     assert updated == 1
     job = get_job(db, jid)
     assert job["validation_revision"] == 1
+
+def test_job_summary_returns_review_metrics_and_score_buckets(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    jid = "j1"
+    insert_job(db, job_id=jid, prompt="car", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.SMALL)
+    insert_polygons(db, jid, [
+        {"geometry_wkb": b"a", "score": 0.2, "source_tile_row": 0, "source_tile_col": 0},
+        {"geometry_wkb": b"b", "score": 0.4, "source_tile_row": 0, "source_tile_col": 1},
+        {"geometry_wkb": b"c", "score": 0.6, "source_tile_row": 1, "source_tile_col": 0},
+        {"geometry_wkb": b"d", "score": 0.8, "source_tile_row": 1, "source_tile_col": 1},
+    ])
+    validate_bulk(db, jid, [{"pid": 1, "validation": "REJECTED"}])
+    update_missed_estimate(db, jid, 1)
+
+    summary = get_job_summary(db, jid)
+
+    assert summary["prompt"] == "car"
+    assert summary["tile_preset"] == "small"
+    assert summary["total"] == 4
+    assert summary["accepted"] == 3
+    assert summary["rejected"] == 1
+    assert summary["precision_review"] == pytest.approx(0.75)
+    assert summary["recall_estimate"] == pytest.approx(0.75)
+    assert summary["min_score"] == pytest.approx(0.2)
+    assert summary["avg_score"] == pytest.approx(0.5)
+    assert summary["max_score"] == pytest.approx(0.8)
+    assert summary["score_buckets"] == {
+        "lt_035": 1,
+        "gte_035_lt_05": 1,
+        "gte_05_lt_07": 1,
+        "gte_07": 1,
+    }
 
 def test_validate_bulk_handles_many_updates(tmp_path):
     db = tmp_path / "t.db"

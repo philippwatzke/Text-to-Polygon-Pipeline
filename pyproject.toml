@@ -5,7 +5,9 @@ description = "Text-to-Polygon Pipeline — DOP20 + SAM 3.1"
 requires-python = ">=3.12"
 dependencies = [
     "torch>=2.7",
-    "rasterio>=1.3",
+    "torchvision",
+    "numpy>=1.26,<2",
+    "rasterio>=1.4,<1.5",
     "geopandas>=1.0",
     "shapely>=2.0",
     "pyproj>=3.6",
@@ -17,7 +19,9 @@ dependencies = [
     "requests",
     "urllib3>=2",
     "pillow",
-    "numpy",
+    "fiona",
+    "transformers>=5.6",
+    "accelerate",
 ]
 
 [project.optional-dependencies]

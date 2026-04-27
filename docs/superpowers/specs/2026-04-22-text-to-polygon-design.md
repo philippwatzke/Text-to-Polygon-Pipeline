@@ -1,9 +1,16 @@
 # Text-to-Polygon Pipeline — Design Spec
 
 **Datum (Entwurf):** 2026-04-22
-**Letzte Revision:** 2026-04-23
+**Letzte Revision:** 2026-04-25
 **Status:** Entwurf zur Implementierung
 **Scope:** Prototyp (Exploration), Bayern, lokal auf RTX 4070 / 12 GB VRAM / 64 GB RAM
+
+**Revision 2026-04-25:** DOP20-Bezug wurde von WCS auf den verifizierten LDBV
+OpenData WMS umgestellt (`https://geoservices.bayern.de/od/wms/dop/v1/dop20`,
+Layer `by_dop20c`, WMS 1.1.1, `SRS=EPSG:25832`, `FORMAT=image/png`).
+Alle älteren WCS-Bezüge in diesem Entwurf sind historisch zu lesen und werden
+durch die WMS-Verifikation in `docs/wms-verification.md` sowie den
+Implementierungsplan vom 2026-04-24 ersetzt.
 
 ---
 
@@ -20,7 +27,7 @@ Nicht-Ziele: kommerzielles SaaS, Echtzeit-Interaktion, Multi-User-Deployment, Sk
 ## 2. Funktionale Anforderungen
 
 - **FR-1** — Nutzer zeichnet Bounding Box in Leaflet-Karte, gibt freien Text-Prompt ein, startet Job.
-- **FR-2** — System lädt DOP20 vom Bayerischen LDBV-WCS, führt Pipeline aus, präsentiert Ergebnis-Polygone auf der Karte.
+- **FR-2** — System lädt DOP20 vom Bayerischen LDBV-WMS, führt Pipeline aus, präsentiert Ergebnis-Polygone auf der Karte.
 - **FR-3** — Alle detektierten Polygone sind **initial als `ACCEPTED` vormarkiert**. Der Nutzer arbeitet im Subtraktions-Workflow: er klickt nur False Positives an, die auf `REJECTED` gesetzt werden. Das spart bei 3 000 Polygonen 2 990 redundante Klicks gegenüber einem Opt-in-Modell.
 - **FR-4** — Export der akzeptierten Polygone als zweischichtiges GeoPackage (`detected_objects` + `nodata_regions`) in EPSG:25832.
 - **FR-5** — Jobs laufen asynchron; Nutzer kann UI verlassen und später zurückkehren; Job-Historie sichtbar.
@@ -30,7 +37,7 @@ Nicht-Ziele: kommerzielles SaaS, Echtzeit-Interaktion, Multi-User-Deployment, Sk
 
 - **NFR-1 (VRAM):** Nie mehr als ein SAM-3.1-Modell gleichzeitig im VRAM — Concurrency physikalisch auf 1 begrenzt.
 - **NFR-2 (Methodische Validität):** Keine stillen False Negatives. Fehlgeschlagene Kacheln werden als `nodata_regions` dokumentiert.
-- **NFR-3 (Nativ-Auflösung):** WCS-Requests werden grid-aligned zum LDBV-Pixelraster abgesetzt — keine Server-seitige Interpolation. Dies gilt für die Außen-BBox **und** für jeden paginierten Sub-Chunk.
+- **NFR-3 (Nativ-Auflösung):** WMS-GetMap-Requests werden clientseitig auf das verifizierte 0,2-m-Raster ausgerichtet — keine unbeabsichtigte Server-seitige Interpolation. Dies gilt für die Außen-BBox **und** für jeden paginierten Sub-Chunk.
 - **NFR-4 (Kein Blocking):** Webserver blockiert nie auf GPU-Arbeit. Antwortzeit auf `POST /jobs` < 50 ms.
 - **NFR-5 (Crash-Resilienz):** Ein fehlgeschlagener Job oder Worker-Absturz blockiert die Queue nicht länger als einen Worker-Neustart (~10 s).
 - **NFR-6 (Disk-Hygiene):** Kein unbegrenztes Wachstum von Zwischendateien. DOP-Chunks werden nach erfolgreichem Export gelöscht; `nodata_regions` und `polygons` bleiben in SQLite **bis zur Retention-Grenze** (NFR-7).
@@ -85,7 +92,7 @@ Abhängigkeitsrichtung: `app/` → `jobs/`; `worker/` → `pipeline/` und `jobs/
 | Leaflet-UI (Draw, Display) | EPSG:4326 (WGS84) | Leaflet-Standard |
 | HTTP-Bodies (BBox im POST /jobs) | EPSG:4326 | Leaflet liefert so |
 | Interne Persistenz (SQLite WKB) | EPSG:25832 | LDBV-natives CRS, keine Transformationsverluste |
-| WCS-Anfragen an LDBV | EPSG:25832 (grid-snapped) | NFR-3 |
+| WMS-GetMap-Anfragen an LDBV | EPSG:25832 (grid-snapped) | NFR-3 |
 | GeoPackage-Export | EPSG:25832 | FR-4 |
 | GeoJSON-Antworten an UI (`/jobs/{id}/polygons`) | EPSG:4326 | Leaflet-Standard |
 
@@ -95,7 +102,7 @@ Die Transformation 25832 → 4326 passiert **nur** in `app/routes/jobs.py` unmit
 
 Jede Stufe ist ein Modul in `pipeline/` mit klar typisierter Ein-/Ausgabe, isoliert testbar.
 
-### 5.1 `wcs_client.py` — DOP20-Download
+### 5.1 `dop_client.py` — DOP20-WMS-Download
 
 **Aufgabe:** Bounding Box in EPSG:25832 → lokales VRT (Virtual Raster) über heruntergeladene DOP20-Chunks.
 
@@ -131,11 +138,11 @@ Jede Stufe ist ein Modul in `pipeline/` mit klar typisierter Ein-/Ausgabe, isoli
     maxy_s = snap_ceil(maxy, _ORIGIN_Y)
     ```
 
-    `origin_x` / `origin_y` stammen aus den verifizierten WCS-Capabilities der Coverage. Falls die Coverage tatsächlich auf `(0, 0)` liegt, degeneriert die Formel auf den einfacheren Spezialfall. Ohne origin-sensitives Snap führt der WCS-Server trotz korrekter Schrittweite Sub-Pixel-Interpolation durch.
+    Da der verifizierte WMS keine Coverage-Grid-Origin publiziert, verwendet die Implementierung die feste 0,2-m-Metergrid-Origin `(0, 0)` in EPSG:25832. `docs/wms-verification.md` belegt per Adjacent-Chunk- und Stitch-Test, dass damit nahtlose, byte-identische Chunks entstehen. `origin_x` / `origin_y` bleiben konfigurierbar, defaulten aber auf `0.0`.
 
-2. **WCS-Pagination:** LDBV-Coverages haben ein hartes Pixel-Limit (`MAX_WCS_PIXELS = 4000` in `config.py`, exakter Wert beim ersten `GetCapabilities`-Call verifizieren). Die snap-gealignte Außen-BBox wird in ein Grid aus Sub-BBoxes zerlegt, von denen **jede ebenfalls auf das 0.2-m-Raster ausgerichtet ist**. Innenliegende Chunks nutzen die volle Kantenlänge `MAX_WCS_PIXELS * 0.2 m = 800 m`; Rand-Chunks dürfen kleiner sein, müssen aber weiterhin aus einer ganzzahligen Pixelzahl bestehen. Entscheidend ist nicht „immer 800 m“, sondern **nahtlose gemeinsame Chunk-Kanten auf demselben 0.2-m-Grid**. Jeder Chunk wird als `data/dop/{job_id}/chunk_{r}_{c}.tif` gespeichert.
+2. **WMS-Pagination:** Der LDBV OpenData-WMS hat ein hartes Pixel-Limit von `6000 x 6000` Pixeln (`WMS_MAX_PIXELS = 6000`, verifiziert in `docs/wms-verification.md`). Die snap-gealignte Außen-BBox wird in ein Grid aus Sub-BBoxes zerlegt, von denen **jede ebenfalls auf das 0.2-m-Raster ausgerichtet ist**. Innenliegende Chunks nutzen die volle Kantenlänge `WMS_MAX_PIXELS * 0.2 m = 1200 m`; Rand-Chunks dürfen kleiner sein, müssen aber weiterhin aus einer ganzzahligen Pixelzahl bestehen. Entscheidend ist nicht „immer 1200 m“, sondern **nahtlose gemeinsame Chunk-Kanten auf demselben 0.2-m-Grid**. Jeder Chunk wird als `data/dop/{job_id}/chunk_{r}_{c}.tif` gespeichert.
 
-3. **Harte Timeouts:** Jeder HTTP-Request mit `timeout=(10, 60)` (connect / read). Retries via `urllib3.Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504])` → exponentielle Backoff 2–8 s. Nach endgültigem Fehlschlag: `WCSError`-Exception, Job `FAILED` mit `error_reason='WCS_TIMEOUT'`.
+3. **Harte Timeouts:** Jeder HTTP-Request mit `timeout=(10, 60)` (connect / read). Retries via `urllib3.Retry(total=3, backoff_factor=2, status_forcelist=[500, 502, 503, 504])` → exponentielle Backoff 2–8 s. Nach endgültigem Fehlschlag: `DopDownloadError`-Exception, Job `FAILED` mit `error_reason='DOP_TIMEOUT'` oder `error_reason='DOP_HTTP_ERROR'`.
 
 4. **Margin-Expansion (Edge-Protection):** Nach dem Grid-Snapping wird die BBox in alle vier Richtungen um `CENTER_MARGIN × 0.2 m` erweitert (32 m für small, 64 m für medium, 96 m für large — passend zum `tile_preset` des Jobs). **Warum zwingend:** Der BBox-Center-Filter in 5.4 verwirft Polygone, deren Mittelpunkt im Rand-Streifen liegt. Zwischen Kacheln ist das korrekt — dort übernimmt der Nachbar. Am absoluten VRT-Rand gibt es aber keinen Nachbarn. Ohne diese Expansion wäre die äußere `CENTER_MARGIN`-Zone der vom Nutzer angeforderten Fläche systematisch leer — das verfälscht jede ALKIS-Evaluation. Mit der Expansion liegt die angeforderte Fläche vollständig in Safe-Zentren. Die maximal abbildbare Objektgröße bleibt davon getrennt `2 × CENTER_MARGIN × 0.2 m` (64 m / 128 m / 192 m für small / medium / large). Der Download wird etwas größer (für medium-Preset bei 2×2 km BBox: 2.128×2.128 km), bleibt aber unkritisch.
 
@@ -143,27 +150,27 @@ Jede Stufe ist ein Modul in `pipeline/` mit klar typisierter Ein-/Ausgabe, isoli
 
 5. **Minimalgröße garantieren:** Nach Expansion prüft der Client, ob `(maxx - minx) < TILE_SIZE * 0.2 m = 204.8 m` oder analog in y. Falls ja, wird die BBox **symmetrisch weiter expandiert** auf exakt 204.8 m (ebenfalls grid-aligned). So ist garantiert, dass das resultierende VRT mindestens 1024 × 1024 px groß ist und `tiler.iter_tiles()` nicht auf Out-of-Bounds-Reads läuft.
 
-6. **Pixel-Dimensionen für WCS-Request:** Die Pixelzahl des WCS-`GetCoverage`-Calls wird über den WCS-2.0-Scaling-Parameter aus der BBox berechnet (`ScaleSize` nach OGC 12-039, falls Task 0 keinen LDBV-spezifischen alternativen Parameternamen verifiziert). **Achtung Fließkomma-Falle:** `int((maxx_s - minx_s) / 0.2)` kann wegen IEEE-754-Ungenauigkeiten 1499 statt 1500 ergeben (z. B. `300.0 / 0.2 == 1499.9999999999998`). Der Server würde dann 300 m in 1499 px interpolieren — das macht das Grid-Snapping zunichte. Lösung: **zwingend `round()` statt `int()`**, oder noch robuster via `Decimal`:
+6. **Pixel-Dimensionen für WMS-GetMap:** Die Pixelzahl des WMS-`GetMap`-Calls wird als `WIDTH` / `HEIGHT` aus der BBox berechnet. **Achtung Fließkomma-Falle:** `int((maxx_s - minx_s) / 0.2)` kann wegen IEEE-754-Ungenauigkeiten 1499 statt 1500 ergeben (z. B. `300.0 / 0.2 == 1499.9999999999998`). Der Server würde dann 300 m in 1499 px interpolieren — das macht das Grid-Snapping zunichte. Lösung: **zwingend `round()` bzw. die Decimal-basierte `pixel_count()`-Hilfsfunktion statt `int()`**:
     ```python
     width_px = round((maxx_s - minx_s) / 0.2)
     # oder: int((Decimal(str(maxx_s)) - Decimal(str(minx_s))) / Decimal("0.2"))
     ```
 
-7. **Chunk-Grenzen lückenlos, nicht versetzt:** Benachbarte Chunks müssen an derselben Rasterkante zusammentreffen: `next_minx = prev_maxx`, `next_miny = prev_maxy`. Ein künstlicher `+ 0.2 m`-Versatz würde zwischen zwei Chunks eine echte 1-Pixel-Lücke erzeugen; `gdal.BuildVRT` mosaikiert solche Lücken als NoData-Streifen. Die Robustheit kommt daher, dass alle Chunk-Bounds und `WIDTH`/`HEIGHT` aus demselben grid-gesnappten Koordinatensystem und ganzzahligen Pixelzahlen abgeleitet werden. Zu verifizieren beim ersten `GetCoverage`: zwei benachbarte Chunks mit identischer Grenzkante erzeugen im VRT **weder Lücke noch Doppelreihe**.
+7. **Chunk-Grenzen lückenlos, nicht versetzt:** Benachbarte Chunks müssen an derselben Rasterkante zusammentreffen: `next_minx = prev_maxx`, `next_miny = prev_maxy`. Ein künstlicher `+ 0.2 m`-Versatz würde zwischen zwei Chunks eine echte 1-Pixel-Lücke erzeugen; das VRT würde solche Lücken als NoData-Streifen lesen. Die Robustheit kommt daher, dass alle Chunk-Bounds und `WIDTH`/`HEIGHT` aus demselben grid-gesnappten Koordinatensystem und ganzzahligen Pixelzahlen abgeleitet werden. Verifiziert für den WMS in `docs/wms-verification.md`: benachbarte GetMap-Chunks mit identischer Grenzkante erzeugen beim Stitch-Test **weder Lücke noch Doppelreihe**.
 
-8. **VRT-Erzeugung:** Nach Download `gdal.BuildVRT(out.vrt, chunk_files)` — reines XML, kein Pixeltransfer. Downstream-Tiler liest on-demand, RAM-Footprint ≈ 0. VRT-Pfad wird in `jobs.dop_vrt_path` gespeichert.
+8. **VRT-Erzeugung:** Nach Download schreibt `dop_client._build_vrt(out.vrt, chunk_files, crs=...)` ein explizites GDAL-VRT-XML mit `SimpleSource` pro Chunk und Band — kein Pixeltransfer und keine Python-`osgeo`-Bindings nötig. Das VRT wird unmittelbar mit Rasterio geöffnet, damit fehlerhafte XML-/Georeferenzierung früh auffällt. Downstream-Tiler liest on-demand, RAM-Footprint ≈ 0. VRT-Pfad wird in `jobs.dop_vrt_path` gespeichert.
 
 **Signatur:**
 ```python
-class WCSError(Exception): ...
+class DopDownloadError(Exception): ...
 
-def download_dop20(bbox_utm: BBox25832, center_margin_px: int, out_dir: Path) -> Path:
+def download_dop20(bbox_utm: BBox25832, out_dir: Path, *, wms_url: str, layer: str, ...) -> Path:
     """
     Lädt DOP20 paginiert, schreibt chunk_*.tif + out.vrt nach out_dir.
     bbox_utm MUSS bereits auf 0.2m-Grid geschnappt sein.
     center_margin_px steuert die Edge-Expansion (64/128/192 m je nach tile_preset).
     Returns: Path zur .vrt-Datei.
-    Raises: WCSError bei endgültigem HTTP-Fehler.
+    Raises: DopDownloadError bei endgültigem HTTP- oder Mosaik-Fehler.
     """
 ```
 
@@ -237,7 +244,7 @@ Das zwingt GDAL, alte Handles aggressiv zu schließen und wiederzuverwenden. `sr
 
 **NoData-Erkennung vor Inferenz:** DOP20-Coverages haben endliche Grenzen (Landesgrenzen, Lücken im Bestand). Wenn die Margin-Expansion aus 5.1 Punkt 4 über diese Grenzen hinaus geht oder ein Chunk-Download Lücken hat, liefert der Server NoData-Pixel. **Primärsignal dafür sind Raster-Masken / GDAL-NoData-Metadaten, nicht die RGB-Werte selbst.** SAM 3.1 halluziniert an harten Datenkanten Objekte, die die Evaluation verfälschen. Für NFR-2 ist aber **nicht die gesamte Kachel**, sondern das **Safe-Zentrum** entscheidend: Sobald dort NoData liegt, ist die exklusive Verantwortungszone der Kachel kompromittiert und ein stilles False Negative möglich.
 
-Vor Übergabe an SAM prüft der Tiler deshalb pro Kachel zuerst die **verifizierte Raster-Maske** des WCS-Outputs:
+Vor Übergabe an SAM prüft der Tiler deshalb pro Kachel zuerst die **verifizierte Raster-Maske** des WMS/GeoTIFF-Outputs:
 
 ```python
 nodata_mask = src.read_masks(1, window=window) == 0
@@ -507,7 +514,7 @@ CREATE TABLE jobs (
                           'PENDING', 'DOWNLOADING', 'INFERRING',
                           'READY_FOR_REVIEW', 'EXPORTED', 'FAILED')),
     error_reason      TEXT CHECK (error_reason IS NULL OR error_reason IN (
-                          'WCS_TIMEOUT', 'WCS_HTTP_ERROR', 'OOM',
+                          'DOP_TIMEOUT', 'DOP_HTTP_ERROR', 'OOM',
                           'INFERENCE_ERROR', 'WORKER_RESTARTED',
                           'EXPORT_ERROR', 'INVALID_GEOMETRY')),
     error_message     TEXT,                             -- Stacktrace-Tail (letzte ~20 Zeilen)
@@ -569,7 +576,7 @@ Alle Request/Response-Bodies sind JSON. Koordinaten-BBoxes einheitlich als `[min
 
 **Validierungsregeln Server-seitig:**
 - `POST /jobs`: `bbox_wgs84` muss valide Bounds haben (`minx < maxx`, `miny < maxy`), und die Flächenprüfung für `MAX_BBOX_AREA_KM2 = 1.0` erfolgt **nicht in WGS84-Grad**, sondern auf der **unexpandierten User-BBox nach Transformation nach EPSG:25832** (bzw. äquivalent geodätisch). Nur so entspricht „1 km²“ tatsächlich dem Browser-/Runtime-Limit. Prompt non-empty nach `strip()`, Länge ≤ `MAX_PROMPT_CHARS`, **und** die vom echten Modell-Encode-Pfad erzeugte finale Textsequenz muss in `MAX_ENCODER_CONTEXT_TOKENS` passen. Char-Limits sind nur ein grober UX-Guard; maßgeblich ist die **vollständig templatisierte** Encoder-Sequenz inklusive Spezialtokens. Bei Überschreitung → HTTP 422 mit klarer Fehlermeldung („Prompt zu lang für Modellkontext; bitte kurze Nomenphrase verwenden“). `tile_preset` muss in `{"small", "medium", "large"}` liegen, fehlend ⇒ `medium`.
-- **Geographic Fence (Bayern):** Die gesamte BBox muss innerhalb WGS84-Grenzen `lon ∈ [8.9, 13.9]`, `lat ∈ [47.2, 50.6]` liegen (`BAYERN_BBOX_WGS84` in config). Verletzung ⇒ HTTP 422 `Unprocessable Entity`. Ohne diesen Check würde eine BBox über Berlin oder dem Atlantik als PENDING akzeptiert, der Worker produzierte FAILED-Jobs mit nichtssagenden WCS-Fehlern.
+- **Geographic Fence (Bayern):** Die gesamte BBox muss innerhalb WGS84-Grenzen `lon ∈ [8.9, 13.9]`, `lat ∈ [47.2, 50.6]` liegen (`BAYERN_BBOX_WGS84` in config). Verletzung ⇒ HTTP 422 `Unprocessable Entity`. Ohne diesen Check würde eine BBox über Berlin oder dem Atlantik als PENDING akzeptiert, der Worker produzierte FAILED-Jobs mit nichtssagenden DOP/WMS-Fehlern.
 - `POST /jobs/{id}/export`: 409 Conflict, wenn Status weder `READY_FOR_REVIEW` noch `EXPORTED` ist. 404, wenn Job nicht existiert. **Der Export-Aufruf selbst ist durch ein modul-weites `threading.Lock` serialisiert** — GDAL/Fiona sind nicht thread-safe, zwei parallele GeoPackage-Writes (z. B. bei Doppelklick) würden Uvicorn per Segfault reißen. Der Lock wrappt den `export_two_layer_gpkg`-Aufruf; wartende Requests antworten nach ihrem Abschluss regulär, es gibt kein Queue-Backlog weil Export-Zeit im Sekundenbereich liegt. Nach erfolgreichem Schreiben gilt: `status='EXPORTED'` und `exported_revision = validation_revision`. Export und GeoJSON-Endpunkte geben ausschließlich Geometrien innerhalb von `bbox_utm_snapped` zurück.
 - `POST /jobs/{id}/polygons/validate_bulk`: 409 Conflict für den ganzen Bulk-Call, wenn Job-Status nicht reviewbar ist (`PENDING`, `DOWNLOADING`, `INFERRING`, `FAILED`). `READY_FOR_REVIEW` **und** `EXPORTED` sind gültige Zielzustände. Implementierung **zwingend mit `cursor.executemany()`**, nicht mit manuellem `VALUES (...)`-Query-Building: letzteres sprengt bei hunderten Updates das `SQLITE_MAX_VARIABLE_NUMBER`-Limit (999 bzw. 32 766 je nach Kompilierung) und wirft `OperationalError`. `executemany` stückelt intern sicher und behandelt alles in einer Transaktion. Unbekannte PIDs werden ignoriert, die Response zählt nur erfolgreich aktualisierte (via `cursor.rowcount` nach Commit). In derselben Transaktion wird `jobs.validation_revision = validation_revision + 1` erhöht, damit der GeoJSON-Cache deterministisch invalidiert wird; `exported_revision` bleibt unverändert und markiert einen evtl. stale Export.
 
@@ -746,7 +753,7 @@ Fokus auf `pipeline/`-Module (reine Funktionen, gut isolierbar). Keine Tests fü
 
 | Modul | Test-Typ | Was wird geprüft |
 |---|---|---|
-| `wcs_client.py` | Unit mit `responses`-Mock | Grid-Snapping (inkl. Chunk-Alignment), `transform_bounds`-Verwendung, Margin-Expansion (jedes Preset expandiert um korrekten CENTER_MARGIN × 0.2 m in alle 4 Richtungen), Mikro-BBox-Expansion (<204.8 m → genau 204.8 m), **origin-sensitives Snapping** (verifiziert mit abweichendem Origin, z. B. `origin_x=0.1`), WCS-Pixel-Dimension via `round()` (verifiziert mit `300.0/0.2`-Edge-Case → 1500, nicht 1499), **nahtlose Chunk-Kanten (`chunk_{n+1}.minx == chunk_n.maxx`) ohne NoData-Lücke und ohne Doppelreihe im fertigen VRT**, Pagination bei >4000 px, Timeout-Handling, Retry-Logik, `WCSError` bei Dauer-5xx |
+| `dop_client.py` | Unit mit `responses`-Mock | Grid-Snapping (inkl. Chunk-Alignment), `transform_bounds`-Verwendung, Margin-Expansion (jedes Preset expandiert um korrekten CENTER_MARGIN × 0.2 m in alle 4 Richtungen), Mikro-BBox-Expansion (<204.8 m → genau 204.8 m), WMS-GetMap-Parameter (`SRS=` bei Version 1.1.1, BBOX X/Y-Reihenfolge), Pixel-Dimension via Decimal-basierter `pixel_count()` (verifiziert mit `300.0/0.2`-Edge-Case → 1500, nicht 1499), **nahtlose Chunk-Kanten (`chunk_{n+1}.minx == chunk_n.maxx`) ohne NoData-Lücke und ohne Doppelreihe im fertigen VRT**, Pagination bei >6000 px, Timeout-Handling, Retry-Logik, `DopDownloadError` bei Dauer-5xx, PNG muss RGBA sein |
 | `tiler.py` | Unit mit synthetischem GeoTIFF (Fixture) | Korrekte Tile-Grenzen für alle drei Presets, `src.window_transform(window)`-basierte Per-Tile-Affine liefert korrekte UTM-Koordinaten (verifiziert via bekanntem Punkt), Overlap korrekt, Edge-Tile-Verschiebung am VRT-Rand, **letzte verschobene Rand-Kachel behält eindeutige logische `tile_row`/`tile_col`**, `TileConfig.from_preset()`, NoData-Tile-Erkennung basiert auf **Raster-Masken / NoData-Tags im Safe-Zentrum** (NoData im Safe-Zentrum → `reason='NODATA_PIXELS'`, NoData nur am Tile-Rand → Tile bleibt zulässig), **RGB-schwarze Pixel ohne NoData-Maske markieren kein Tile als NoData**, **Fixture mit 4-Band-Alpha-GeoTIFF → Tiler liest nur Band 1–3, Array-Shape korrekt `(H,W,3)` und NoData-Maske Shape `(H,W)`** |
 | `segmenter.py` | Integration mit Stub/Snapshot-Outputs | Tile-lokale Deduplikation: score-sortierte Rohmasken werden bei hoher IoU oder starker Verschachtelung unterdrückt; unterschiedliche, räumlich getrennte Objekte bleiben erhalten |
 | `merger.py` | Unit mit synthetischen Masken | BBox-Center-Keep (inkl. Grenzfall Mittelpunkt genau auf Safe-Center-Kante, halboffenes Intervall), C-/L-förmige Masken mit BBox-Center außerhalb der Maske, `rasterio.features.shapes`-Output `(geom_dict, value)` wird korrekt via `shapely.geometry.shape()` konvertiert, **`connectivity=8` erhält diagonal verbundene Maskenteile**, Hintergrund wird nicht als Polygon persistiert, `make_valid` repariert Bowtie, `MultiPolygon`-Zerlegung, **Diagonal-Berühr-Maske erzeugt GeometryCollection → LineString/Point werden via `extract_polygons` verworfen**, Flächenfilter |
@@ -757,27 +764,25 @@ Fokus auf `pipeline/`-Module (reine Funktionen, gut isolierbar). Keine Tests fü
 | `pipeline/geo_utils.py` (Snapping) | Unit mit Edge-Case-Koordinaten | `snap_floor(0.6)==0.6`, `snap_floor(1.3)==1.2`, UTM-Range (600000.15 → 600000.0 / 600000.2) — verifiziert FP-Robustheit |
 | `exporter.py` | Unit, Temp-Verzeichnis | Zwei Layer vorhanden, CRS = EPSG:25832, GeoPackage lesbar mit `fiona`, `nodata_regions`-Geometrie entspricht Safe-Zentrum (nicht Tile-Footprint), **AOI-Clip auf `bbox_utm_snapped` folgt explizit der Clip-Window-Semantik** (schneidende Objekte bleiben als geclipptes Teilobjekt erhalten), **Re-Export überschreibt existierende .gpkg-Datei ohne Duplikate / ValueError**, leeres `detected_gdf` erzeugt trotzdem gültigen `detected_objects`-Layer mit Polygon-Schema **und explizitem CRS EPSG:25832** |
 | `jobs/store.py` | Unit mit temp File-SQLite | CHECK-Constraint-Violations erkannt, Status-Übergänge, WKB-Roundtrip, PRAGMA-Initialisierung; WAL wird nur auf dateibasierter SQLite verifiziert, nicht auf `:memory:` |
-| End-to-End | Integration, Stub-SAM | Mini-GeoTIFF (256×256) als Fixture, Mock-WCS-Response, Stub-Segmenter gibt feste Masken zurück, vollständiger Pipeline-Lauf bis `EXPORTED`, Prüfung der zwei Layer im resultierenden .gpkg |
+| End-to-End | Integration, Stub-SAM | Mini-GeoTIFF (256×256) als Fixture, Mock-WMS/DOP-Download, Stub-Segmenter gibt feste Masken zurück, vollständiger Pipeline-Lauf bis `EXPORTED`, Prüfung der zwei Layer im resultierenden .gpkg |
 
 ## 12. Konfiguration
 
 `config.py` als zentrale Quelle. Überschreibbar über `.env` (pydantic-settings).
 
 ```python
-# WCS — beim ersten GetCapabilities-Call verifizieren
-WCS_URL: str              = "PLACEHOLDER_UNTIL_VERIFIED"   # z.B. https://geoservices.bayern.de/wcs/v2/dop20
-WCS_COVERAGE_ID: str      = "PLACEHOLDER_UNTIL_VERIFIED"
-WCS_VERSION: str          = "2.0.1"
-WCS_MAX_PIXELS: int       = 4000
-WCS_GRID_ORIGIN_X: float  = 0.0   # nach GetCapabilities verifizieren
-WCS_GRID_ORIGIN_Y: float  = 0.0   # nach GetCapabilities verifizieren
-WCS_SUBSET_AXIS_X: str    = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
-WCS_SUBSET_AXIS_Y: str    = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
-WCS_SCALE_SIZE_PARAM: str  = "ScaleSize"                    # OGC 12-039; nach GetCapabilities verifizieren
-WCS_SIZE_AXIS_X: str      = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
-WCS_SIZE_AXIS_Y: str      = "PLACEHOLDER_UNTIL_VERIFIED"   # nach GetCapabilities verifizieren
+# WMS — verifiziert in docs/wms-verification.md
+WMS_URL: str              = "https://geoservices.bayern.de/od/wms/dop/v1/dop20"
+WMS_LAYER: str            = "by_dop20c"
+WMS_VERSION: str          = "1.1.1"
+WMS_FORMAT: str           = "image/png"
+WMS_CRS: str              = "EPSG:25832"
+WMS_MAX_PIXELS: int       = 6000
+WMS_GRID_ORIGIN_X: float  = 0.0
+WMS_GRID_ORIGIN_Y: float  = 0.0
 
 # SAM 3.1
+SAM3_MODEL_ID: str       = "facebook/sam3"
 SAM3_CHECKPOINT: Path     = Path("models/sam3.1_hiera_large.pt")
 
 # Tiling — Presets werden per Request gewählt (siehe 5.2, 8)
@@ -827,11 +832,11 @@ Python 3.12+, PyTorch 2.7+, CUDA 12.6+ (Voraussetzungen für SAM 3.1).
 torch>=2.7
 sam3                    # facebookresearch/sam3
 # Geo
-rasterio>=1.3
+numpy>=1.26,<2          # SAM3-Pin; Rasterio deshalb <1.5
+rasterio>=1.4,<1.5      # kompatibel mit SAM3 numpy<2
 geopandas>=1.0
 shapely>=2.0
 pyproj>=3.6
-gdal                    # via conda empfohlen, für BuildVRT
 # Web
 fastapi
 uvicorn[standard]
@@ -842,15 +847,17 @@ pydantic-settings
 # HTTP
 requests
 urllib3>=2              # für Retry
+transformers>=5.6       # offizieller SAM3-API-Pfad auf Windows
+accelerate
 # Testing
 pytest
 pytest-mock
-responses               # für wcs_client-Mocks
+responses               # für dop_client/WMS-Mocks
 ```
 
 ## 14. Bekannte Einschränkungen (bewusst akzeptiert)
 
-- **Nur Bayern:** `wcs_client` ist auf LDBV-WCS zugeschnitten. Erweiterung auf andere Bundesländer: neue `WcsClient`-Implementierung + Strategiewahl anhand BBox.
+- **Nur Bayern:** `dop_client` ist auf den verifizierten LDBV-DOP20-WMS zugeschnitten. Erweiterung auf andere Bundesländer: neue Provider-Implementierung + Strategiewahl anhand BBox.
 - **Ein Nutzer gleichzeitig:** Die UI hat kein Auth-Konzept, Jobs sind für alle sichtbar. Für lokale Einzelnutzung genügt das.
 - **Keine Job-Stornierung:** Ein laufender Job kann nicht abgebrochen werden. Bei Bedarf: Worker-Prozess töten; der Startup-Hook markiert laufende Jobs als `FAILED`.
 - **Maximale Zielobjekt-Kantenlänge hängt vom gewählten `tile_preset` ab** (Section 5.2, 8): 64 m (small), 128 m (medium — Default), 192 m (large). Objekte, die größer als das gewählte Maximum sind, werden an Safe-Center-Grenzen zersägt — IoU gegen ALKIS kollabiert. Der Nutzer muss das Preset passend zum Prompt wählen. `large` erzeugt bei 1 km² ~6 200 Kacheln (~1 h Laufzeit) — ein Job in diesem Preset ist kein Interaktiv-Workflow.
@@ -861,12 +868,7 @@ responses               # für wcs_client-Mocks
 
 ## 15. Offene Punkte für die Implementierungsphase
 
-- **WCS-Verifikation (höchste Priorität):** Folgende Punkte müssen beim ersten `GetCapabilities`-Call verifiziert werden, bevor irgendein Code produktiv läuft:
-    1. Service-URL und Coverage-ID (Platzhalter in Config)
-    2. Exakter Wert von `MAX_WCS_PIXELS` (nicht geraten)
-    3. Gitter-Origin der DOP20-Coverage (Annahme: UTM-Zone-32N-Origin, aber bestätigen)
-    4. **OGC-WCS-2.0-Axis-Order:** EPSG:25832 ist in manchen CRS-Registries als `(Northing, Easting)` definiert, in anderen als `(Easting, Northing)`. Wenn der `subset`-Parameter in falscher Reihenfolge gesendet wird (z. B. `subset=E(x1,x2)&subset=N(y1,y2)` vs `subset=N(y1,y2)&subset=E(x1,x2)`), lehnt der Server mit HTTP 400 "Invalid Axis" ab. Die korrekte Achsenbezeichnung (`E`/`N`, `x`/`y`, `Long`/`Lat`) und Reihenfolge muss manuell aus dem GetCapabilities-XML abgelesen und hart im Client codiert werden.
-    5. Verhalten benachbarter Chunk-Kanten bei identischen Bounds — es muss verifiziert werden, dass `next_minx = prev_maxx` im fertigen VRT weder eine Lücke noch eine Doppelreihe erzeugt.
+- **WMS-Verifikation:** Abgeschlossen und dokumentiert in `docs/wms-verification.md`: Service-URL, Layer, Version 1.1.1, `SRS=EPSG:25832`, `FORMAT=image/png`, `WMS_MAX_PIXELS=6000`, RGBA-PNG und benachbarte Chunk-Kanten ohne Lücke/Doppelreihe.
 - **MIN_POLYGON_AREA_M2 kalibrieren:** Nach ersten Tests — Default 1 m² als Ausgangspunkt, Rausch-Pixel-Artefakte beobachten.
 - **Performance-Messung:** Tatsächliche Tile-Rate auf der RTX 4070 mit SAM 3.1 — beeinflusst die UI-Fortschrittsanzeige (absolute Zeit vs. % der Tiles) und den Wert von `MAX_JOBS_PER_WORKER`.
 - **SAM-3.1-Model-Größe:** Hiera-Large ist Default. Falls VRAM bei großen Prompts knapp wird, Fallback auf Hiera-Base prüfen.

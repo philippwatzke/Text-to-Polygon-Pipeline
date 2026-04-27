@@ -16,7 +16,9 @@ class Settings(BaseSettings):
     WMS_GRID_ORIGIN_X: float = 0.0
     WMS_GRID_ORIGIN_Y: float = 0.0
 
-    # SAM 3.1
+    # SAM 3.1. Use the Hugging Face model id by default; set this to a local
+    # snapshot directory for offline runs.
+    SAM3_MODEL_ID: str = "facebook/sam3"
     SAM3_CHECKPOINT: Path = Path("models/sam3.1_hiera_large.pt")
 
     # Tiling
@@ -31,6 +33,7 @@ class Settings(BaseSettings):
 
     # Worker
     MAX_JOBS_PER_WORKER: int = 50
+    MAX_WORKER_RUNTIME_SECONDS: int = 24 * 3600  # Spec §10: wall-clock restart
     WORKER_POLL_INTERVAL_SEC: float = 2.0
 
     # API limits
