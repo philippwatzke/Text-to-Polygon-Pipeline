@@ -37,19 +37,30 @@ to Hugging Face:
 
 ## Configure
 
-Copy `.env.example` to `.env`. Defaults point at the LDBV OpenData WMS:
+Copy `.env.example` to `.env`. The pipeline uses the LDBV **WCS** (authenticated)
+for all model input. WMS is kept only as a UI basemap.
 
 ```text
+# Pipeline data path (Basic Auth required)
+WCS_URL=https://geoservices.bayern.de/pro/wcs/dop/v1/wcs_inspire_dop20
+WCS_VERSION=2.0.1
+WCS_COVERAGE_ID=by_dop20c
+WCS_FORMAT=image/tiff
+WCS_CRS=EPSG:25832
+WCS_MAX_PIXELS=6000
+WCS_USERNAME=...
+WCS_PASSWORD=...
+
+# UI-only basemap for the Leaflet review map
 WMS_URL=https://geoservices.bayern.de/od/wms/dop/v1/dop20
 WMS_LAYER=by_dop20c
-WMS_VERSION=1.1.1
-WMS_FORMAT=image/png
-WMS_CRS=EPSG:25832
-WMS_MAX_PIXELS=6000
+
+# Model
 SAM3_MODEL_ID=facebook/sam3
 ```
 
-The WMS verification evidence is in `docs/wms-verification.md`.
+The WCS verification evidence is in `docs/wcs-verification.md`. The WMS
+is documented in `docs/wms-display-verification.md` (UI basemap only).
 
 ## Run
 

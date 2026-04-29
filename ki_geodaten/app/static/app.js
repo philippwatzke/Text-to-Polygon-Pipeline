@@ -41,19 +41,29 @@
   const exportEl = document.getElementById('export');
   const scoreFilterEl = document.getElementById('score-filter');
   const scoreValueEl = document.getElementById('score-value');
+  const segmentOpacityEl = document.getElementById('segment-opacity');
+  const segmentOpacityValueEl = document.getElementById('segment-opacity-value');
   const showRejectedEl = document.getElementById('show-rejected');
   const rejectBelowScoreEl = document.getElementById('reject-below-score');
   const reviewStatsEl = document.getElementById('review-stats');
+  const toggleMissedModeEl = document.getElementById('toggle-missed-mode');
+  const missedStatsEl = document.getElementById('missed-stats');
   const addCompareEl = document.getElementById('add-compare');
-  const missedEstimateEl = document.getElementById('missed-estimate');
-  const saveMissedEstimateEl = document.getElementById('save-missed-estimate');
   const compareListEl = document.getElementById('compare-list');
+  const jobSearchEl = document.getElementById('job-search');
+  const showFailedJobsEl = document.getElementById('show-failed-jobs');
+  const showExportedJobsEl = document.getElementById('show-exported-jobs');
+  const jobCountEl = document.getElementById('job-count');
 
   let bbox = null;
   let currentJobId = null;
   let polygonLayer = null;
   let nodataLayer = null;
+  let missedLayer = null;
   let currentPolygons = null;
+  let currentMissedObjects = null;
+  let latestJobs = [];
+  let missedMode = false;
   let comparisonJobIds = loadComparisonJobIds();
   const pendingUpdates = new Map();
   let flushTimer = null;
@@ -65,6 +75,11 @@
     drawnItems.addLayer(event.layer);
     const b = event.layer.getBounds();
     bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+  });
+
+  map.on('click', (event) => {
+    if (!missedMode || !currentJobId) return;
+    void addMissedObject(event.latlng);
   });
 
   function storageKey(jobId) {
@@ -96,11 +111,12 @@
     const accepted = feature.properties.validation !== 'REJECTED';
     const score = Number(feature.properties.score || 0);
     const underFilter = score < Number(scoreFilterEl.value || 0);
+    const fill = Number(segmentOpacityEl.value || 0.28);
     return {
       color: accepted ? '#2563eb' : '#dc2626',
       fillColor: accepted ? '#60a5fa' : '#f87171',
-      fillOpacity: underFilter ? 0.08 : 0.28,
-      opacity: underFilter ? 0.35 : 1,
+      fillOpacity: underFilter ? Math.max(0.03, fill * 0.3) : fill,
+      opacity: underFilter ? 0.35 : Math.min(1, fill + 0.35),
       weight: underFilter ? 1 : 2,
     };
   }
@@ -135,6 +151,7 @@
 
   function renderReviewStats() {
     scoreValueEl.value = Number(scoreFilterEl.value || 0).toFixed(2);
+    segmentOpacityValueEl.value = Number(segmentOpacityEl.value || 0.28).toFixed(2);
     const counts = reviewCounts();
     reviewStatsEl.textContent =
       `${counts.visible}/${counts.total} visible | ${counts.accepted} accepted | ${counts.rejected} rejected | ${counts.acceptedBelow} below score`;
@@ -165,12 +182,26 @@
     return value === null || value === undefined ? 'n/a' : Number(value).toFixed(3);
   }
 
-  function addMetric(grid, label, value) {
-    const labelEl = document.createElement('span');
-    labelEl.textContent = label;
-    const valueEl = document.createElement('span');
-    valueEl.textContent = value;
-    grid.append(labelEl, valueEl);
+  function jobName(job) {
+    return job?.label || job?.prompt || job?.id || 'job';
+  }
+
+  function shortId(id) {
+    return String(id || '').slice(0, 8);
+  }
+
+  function jobMatchesFilters(job) {
+    if (!showFailedJobsEl.checked && job.status === 'FAILED') return false;
+    if (!showExportedJobsEl.checked && job.status === 'EXPORTED') return false;
+    const q = jobSearchEl.value.trim().toLowerCase();
+    if (!q) return true;
+    return [
+      job.label,
+      job.prompt,
+      job.status,
+      job.id,
+      job.error_reason,
+    ].filter(Boolean).some(value => String(value).toLowerCase().includes(q));
   }
 
   async function fetchJobSummary(jobId) {
@@ -188,58 +219,62 @@
 
     const summaries = await Promise.all(comparisonJobIds.map(fetchJobSummary));
     const validIds = [];
+    const table = document.createElement('table');
+    table.className = 'compare-table';
+    const head = document.createElement('thead');
+    head.innerHTML =
+      '<tr><th>Job</th><th>Accepted</th><th>Rejected</th><th>Missed</th><th>Precision</th><th>Recall</th><th>Avg</th><th></th></tr>';
+    const body = document.createElement('tbody');
+    table.append(head, body);
     summaries.forEach((summary) => {
       if (!summary) return;
       validIds.push(summary.id);
-      const card = document.createElement('article');
-      card.className = 'compare-card';
-
-      const header = document.createElement('header');
-      const titleWrap = document.createElement('div');
+      const row = document.createElement('tr');
+      const nameCell = document.createElement('td');
       const title = document.createElement('div');
       title.className = 'compare-title';
-      title.textContent = summary.prompt;
+      title.textContent = summary.label || summary.prompt;
       const subtitle = document.createElement('div');
       subtitle.className = 'compare-subtitle';
-      subtitle.textContent = `${summary.tile_preset} | ${summary.status} | ${summary.id.slice(0, 8)}`;
-      titleWrap.append(title, subtitle);
+      subtitle.textContent = `${summary.tile_preset} | ${summary.status} | ${shortId(summary.id)}`;
+      nameCell.append(title, subtitle);
 
       const remove = document.createElement('button');
       remove.type = 'button';
       remove.textContent = 'x';
       remove.title = 'Remove from comparison';
+      remove.className = 'compare-remove';
       remove.onclick = () => {
         comparisonJobIds = comparisonJobIds.filter(id => id !== summary.id);
         saveComparisonJobIds();
         void renderComparison();
       };
-      header.append(titleWrap, remove);
-
-      const grid = document.createElement('div');
-      grid.className = 'compare-grid';
-      addMetric(grid, 'Accepted', `${summary.accepted}/${summary.total}`);
-      addMetric(grid, 'Rejected', String(summary.rejected));
-      addMetric(grid, 'Precision', formatPercent(summary.precision_review));
-      addMetric(grid, 'Recall est.', formatPercent(summary.recall_estimate));
-      addMetric(grid, 'Missed est.', summary.missed_estimate ?? 'n/a');
-      addMetric(grid, 'Avg score', formatScore(summary.avg_score));
-
-      const buckets = document.createElement('div');
-      buckets.className = 'compare-subtitle';
-      buckets.textContent =
-        `<0.35 ${summary.score_buckets.lt_035} | 0.35-0.50 ${summary.score_buckets.gte_035_lt_05} | 0.50-0.70 ${summary.score_buckets.gte_05_lt_07} | >=0.70 ${summary.score_buckets.gte_07}`;
-
-      card.append(header, grid, buckets);
-      compareListEl.appendChild(card);
-      if (summary.id === currentJobId) {
-        missedEstimateEl.value = summary.missed_estimate ?? '';
-      }
+      const removeCell = document.createElement('td');
+      removeCell.append(remove);
+      row.append(
+        nameCell,
+        cell(`${summary.accepted}/${summary.total}`),
+        cell(String(summary.rejected)),
+        cell(String(summary.missed_marked || 0)),
+        cell(formatPercent(summary.precision_review)),
+        cell(formatPercent(summary.recall_estimate)),
+        cell(formatScore(summary.avg_score)),
+        removeCell,
+      );
+      body.appendChild(row);
     });
+    compareListEl.appendChild(table);
 
     if (validIds.length !== comparisonJobIds.length) {
       comparisonJobIds = validIds;
       saveComparisonJobIds();
     }
+  }
+
+  function cell(text) {
+    const td = document.createElement('td');
+    td.textContent = text;
+    return td;
   }
 
   function renderPolygons() {
@@ -272,23 +307,123 @@
     renderReviewStats();
   }
 
+  function renderMissedStats() {
+    const count = currentMissedObjects?.features?.length || 0;
+    missedStatsEl.textContent = `${count} marked | ${missedMode ? 'click map to add' : 'mode off'}`;
+    toggleMissedModeEl.classList.toggle('active-mode', missedMode);
+    toggleMissedModeEl.textContent = missedMode ? 'Stop marking' : 'Mark misses';
+  }
+
+  function renderMissedObjects() {
+    if (missedLayer) missedLayer.remove();
+    if (!currentMissedObjects) {
+      renderMissedStats();
+      return;
+    }
+    missedLayer = L.geoJSON(currentMissedObjects, {
+      pointToLayer: (_feature, latlng) => L.circleMarker(latlng, {
+        radius: 6,
+        color: '#f59e0b',
+        fillColor: '#fbbf24',
+        fillOpacity: 0.9,
+        weight: 2,
+      }),
+      onEachFeature: (feature, layer) => {
+        layer.bindPopup(`Missed object<br>ID: ${feature.properties.id}<br>Click marker to remove`);
+        layer.on('click', (event) => {
+          L.DomEvent.stopPropagation(event);
+          void removeMissedObject(feature.properties.id);
+        });
+      },
+    }).addTo(map);
+    renderMissedStats();
+  }
+
+  async function refreshMissedObjects() {
+    if (!currentJobId) return;
+    currentMissedObjects = await fetch(`/jobs/${currentJobId}/missed_objects`).then(r => r.json());
+    renderMissedObjects();
+    void renderComparison();
+  }
+
+  async function addMissedObject(latlng) {
+    const res = await fetch(`/jobs/${currentJobId}/missed_objects`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({lon: latlng.lng, lat: latlng.lat}),
+    });
+    if (!res.ok) {
+      statusEl.textContent = 'Missed object save failed';
+      return;
+    }
+    statusEl.textContent = 'Missed object marked';
+    await refreshMissedObjects();
+  }
+
+  async function removeMissedObject(missedId) {
+    if (!currentJobId) return;
+    const res = await fetch(`/jobs/${currentJobId}/missed_objects/${missedId}`, {
+      method: 'DELETE',
+    });
+    statusEl.textContent = res.ok ? 'Missed object removed' : 'Remove missed object failed';
+    if (res.ok) await refreshMissedObjects();
+  }
+
   async function refreshJobs() {
     const res = await fetch('/jobs');
     const jobs = await res.json();
+    latestJobs = jobs;
+    renderJobs();
+  }
+
+  function renderJobs() {
+    const jobs = latestJobs.filter(jobMatchesFilters);
     jobsEl.innerHTML = '';
+    jobCountEl.textContent = `${jobs.length}/${latestJobs.length}`;
     for (const job of jobs) {
       const el = document.createElement('div');
       el.className = 'job';
+      if (job.id === currentJobId) el.classList.add('active');
       const done = (job.tile_completed || 0) + (job.tile_failed || 0);
-      el.textContent = `${job.prompt} - ${job.status} ${done}/${job.tile_total || '?'}`;
+      const titleWrap = document.createElement('div');
+      const title = document.createElement('div');
+      title.className = 'job-title';
+      title.textContent = jobName(job);
+      const meta = document.createElement('div');
+      meta.className = 'job-meta';
+      meta.textContent = `${job.status} ${done}/${job.tile_total || '?'} | ${shortId(job.id)}`;
+      titleWrap.append(title, meta);
       if (job.status === 'FAILED') {
         el.title = [job.error_reason, job.error_message].filter(Boolean).join('\n\n');
-        const reason = job.error_reason ? ` (${job.error_reason})` : '';
-        el.textContent = `${job.prompt} - FAILED${reason}`;
+        meta.textContent = `FAILED${job.error_reason ? ` (${job.error_reason})` : ''} | ${shortId(job.id)}`;
       }
+      const actions = document.createElement('div');
+      actions.className = 'job-actions';
+      const rename = document.createElement('button');
+      rename.type = 'button';
+      rename.textContent = 'Rename';
+      rename.onclick = (event) => {
+        event.stopPropagation();
+        void renameJob(job);
+      };
+      actions.append(rename);
+      el.append(titleWrap, actions);
       el.onclick = () => openJob(job.id);
       jobsEl.appendChild(el);
     }
+  }
+
+  async function renameJob(job) {
+    const next = window.prompt('Job name', job.label || job.prompt || '');
+    if (next === null) return;
+    const res = await fetch(`/jobs/${job.id}/label`, {
+      method: 'PATCH',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({label: next}),
+    });
+    statusEl.textContent = res.ok ? 'Job renamed' : 'Rename failed';
+    await refreshJobs();
+    void renderComparison();
   }
 
   async function flushValidations() {
@@ -378,14 +513,17 @@
     hydratePending(jobId);
     if (polygonLayer) polygonLayer.remove();
     if (nodataLayer) nodataLayer.remove();
-    const [polygons, nodata, summary] = await Promise.all([
+    if (missedLayer) missedLayer.remove();
+    const [polygons, nodata, missed, summary] = await Promise.all([
       fetch(`/jobs/${jobId}/polygons`).then(r => r.json()),
       fetch(`/jobs/${jobId}/nodata`).then(r => r.json()),
+      fetch(`/jobs/${jobId}/missed_objects`).then(r => r.json()),
       fetchJobSummary(jobId),
     ]);
     currentPolygons = polygons;
-    missedEstimateEl.value = summary?.missed_estimate ?? '';
+    currentMissedObjects = missed;
     renderPolygons();
+    renderMissedObjects();
     nodataLayer = L.geoJSON(nodata, {
       style: {color: '#111827', fillOpacity: 0.1, dashArray: '4 4'},
     }).addTo(map);
@@ -393,8 +531,20 @@
   }
 
   scoreFilterEl.addEventListener('input', renderPolygons);
+  segmentOpacityEl.addEventListener('input', renderPolygons);
   showRejectedEl.addEventListener('change', renderPolygons);
+  jobSearchEl.addEventListener('input', renderJobs);
+  showFailedJobsEl.addEventListener('change', renderJobs);
+  showExportedJobsEl.addEventListener('change', renderJobs);
   rejectBelowScoreEl.addEventListener('click', rejectAcceptedBelowScore);
+  toggleMissedModeEl.addEventListener('click', () => {
+    if (!currentJobId) {
+      statusEl.textContent = 'Open a job first';
+      return;
+    }
+    missedMode = !missedMode;
+    renderMissedStats();
+  });
   addCompareEl.addEventListener('click', () => {
     if (!currentJobId) {
       statusEl.textContent = 'Open a job first';
@@ -406,25 +556,21 @@
     }
     void renderComparison();
   });
-  saveMissedEstimateEl.addEventListener('click', async () => {
-    if (!currentJobId) {
-      statusEl.textContent = 'Open a job first';
-      return;
-    }
-    const raw = missedEstimateEl.value.trim();
-    const missed = raw === '' ? null : Number(raw);
-    if (missed !== null && (!Number.isInteger(missed) || missed < 0)) {
-      statusEl.textContent = 'Missed estimate must be a non-negative integer';
-      return;
-    }
-    const res = await fetch(`/jobs/${currentJobId}/missed_estimate`, {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({missed_estimate: missed}),
-    });
-    statusEl.textContent = res.ok ? 'Estimate saved' : 'Estimate failed';
-    await renderComparison();
-  });
+  function readNumberInput(id) {
+    const el = document.getElementById(id);
+    if (!el || el.value === '') return null;
+    const n = Number(el.value);
+    return Number.isFinite(n) ? n : null;
+  }
+
+  function buildModalityFilter() {
+    return {
+      ndvi_min: readNumberInput('ndvi-min'),
+      ndvi_max: readNumberInput('ndvi-max'),
+      ndsm_min: readNumberInput('ndsm-min'),
+      ndsm_max: readNumberInput('ndsm-max'),
+    };
+  }
 
   submitEl.onclick = async () => {
     if (!bbox) {
@@ -438,6 +584,7 @@
         prompt: promptEl.value,
         bbox_wgs84: bbox,
         tile_preset: presetEl.value,
+        modality_filter: buildModalityFilter(),
       }),
     });
     if (!res.ok) {
@@ -474,4 +621,5 @@
   setInterval(refreshJobs, 3000);
   void refreshJobs();
   void renderComparison();
+  renderMissedStats();
 })();

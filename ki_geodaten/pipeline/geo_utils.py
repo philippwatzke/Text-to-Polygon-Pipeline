@@ -13,6 +13,9 @@ def _transformer_25832_to_4326() -> pyproj.Transformer:
 def transformer_25832_to_4326() -> pyproj.Transformer:
     return _transformer_25832_to_4326()
 
+def transformer_4326_to_25832() -> pyproj.Transformer:
+    return _transformer_4326_to_25832()
+
 def snap_floor(x: float, origin: float, step: float = 0.2) -> float:
     d_origin = Decimal(str(origin))
     d_step = Decimal(str(step))

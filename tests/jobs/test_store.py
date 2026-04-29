@@ -7,6 +7,7 @@ from ki_geodaten.jobs.store import (
     get_job_summary,
     init_schema,
     insert_job,
+    update_job_label,
     update_missed_estimate,
     update_status,
 )
@@ -47,6 +48,7 @@ def test_init_schema_adds_missed_estimate_to_existing_jobs_table(tmp_path: Path)
     with connect(db) as conn:
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     assert "missed_estimate" in cols
+    assert "label" in cols
 
 def test_connect_sets_wal_mode(tmp_path):
     db = tmp_path / "t.db"
@@ -70,8 +72,22 @@ def test_insert_and_get_job(tmp_path):
     job = get_job(db, jid)
     assert job["status"] == JobStatus.PENDING
     assert job["prompt"] == "building"
+    assert job["label"] is None
     assert job["validation_revision"] == 0
     assert job["exported_revision"] is None
+
+def test_update_job_label(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    jid = "j1"
+    insert_job(db, job_id=jid, prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+
+    update_job_label(db, jid, "SAM only")
+    assert get_job(db, jid)["label"] == "SAM only"
+
+    update_job_label(db, jid, None)
+    assert get_job(db, jid)["label"] is None
 
 def test_status_check_constraint_rejects_unknown(tmp_path):
     db = tmp_path / "t.db"
@@ -154,6 +170,7 @@ def test_job_summary_returns_review_metrics_and_score_buckets(tmp_path):
     summary = get_job_summary(db, jid)
 
     assert summary["prompt"] == "car"
+    assert summary["label"] is None
     assert summary["tile_preset"] == "small"
     assert summary["total"] == 4
     assert summary["accepted"] == 3

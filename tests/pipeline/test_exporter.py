@@ -2,7 +2,7 @@ from pathlib import Path
 
 import geopandas as gpd
 import pytest
-from shapely.geometry import Polygon, box
+from shapely.geometry import Point, Polygon, box
 
 fiona = pytest.importorskip("fiona")
 
@@ -31,6 +31,14 @@ def _nodata_gdf(geoms, reasons=None):
     return gpd.GeoDataFrame({"reason": reasons}, geometry=list(geoms), crs="EPSG:25832")
 
 
+def _missed_gdf(geoms):
+    return gpd.GeoDataFrame(
+        {"created_at": ["2026-04-27T00:00:00+00:00"] * len(geoms)},
+        geometry=list(geoms),
+        crs="EPSG:25832",
+    )
+
+
 def test_export_writes_two_layers(tmp_path: Path):
     out = tmp_path / "j.gpkg"
     inside = Polygon(
@@ -41,6 +49,18 @@ def test_export_writes_two_layers(tmp_path: Path):
     layers = fiona.listlayers(str(out))
     assert "detected_objects" in layers
     assert "nodata_regions" in layers
+    assert "missed_objects" in layers
+
+
+def test_export_writes_missed_points(tmp_path: Path):
+    out = tmp_path / "j.gpkg"
+    missed = _missed_gdf([Point(691100, 5335100), Point(700000, 5400000)])
+    export_two_layer_gpkg(_detected_gdf([]), _nodata_gdf([]), _aoi(), out, missed_gdf=missed)
+
+    gdf = gpd.read_file(out, layer="missed_objects")
+
+    assert len(gdf) == 1
+    assert gdf.geometry.iloc[0].geom_type == "Point"
 
 
 def test_export_clips_crossing_polygon_to_aoi(tmp_path: Path):

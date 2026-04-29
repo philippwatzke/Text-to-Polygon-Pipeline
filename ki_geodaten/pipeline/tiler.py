@@ -7,7 +7,9 @@ from typing import Iterator, Literal
 import numpy as np
 import rasterio
 from affine import Affine
-from rasterio.windows import Window
+from rasterio.enums import Resampling
+from rasterio.vrt import WarpedVRT
+from rasterio.windows import Window, from_bounds as window_from_bounds
 from shapely.geometry import Polygon
 
 from ki_geodaten.models import TilePreset
@@ -50,6 +52,13 @@ class Tile:
     tile_row: int
     tile_col: int
     nodata_mask: np.ndarray
+    ownership_bounds_pixel: tuple[float, float, float, float] | None = None
+    # Optional auxiliary modalities, both already resampled onto the tile's
+    # DOP-grid and therefore identically shaped (size × size). They are
+    # populated by iter_tiles only when explicitly requested, so existing
+    # callers see None and can ignore them.
+    nir: np.ndarray | None = None  # uint8, DOP20 band 4
+    ndsm: np.ndarray | None = None  # float32, height above ground in metres
 
 
 @dataclass(frozen=True)
@@ -82,6 +91,17 @@ def iter_grid(src, cfg: TileConfig) -> Iterator[tuple[int, int, int, int]]:
             yield (tile_row, tile_col, row_off, col_off)
 
 
+def _ownership_intervals(offsets: list[int], size: int, margin: int) -> list[tuple[float, float]]:
+    intervals: list[tuple[float, float]] = []
+    for idx, offset in enumerate(offsets):
+        lo = offset + margin
+        hi = offset + size - margin
+        if idx + 1 < len(offsets):
+            hi = min(hi, offsets[idx + 1] + margin)
+        intervals.append((float(lo), float(hi)))
+    return intervals
+
+
 def _safe_center_has_nodata(
     nodata_mask: np.ndarray,
     margin: int,
@@ -92,57 +112,122 @@ def _safe_center_has_nodata(
     return bool(safe_center.mean() > threshold)
 
 
+def _read_ndsm_for_tile(
+    ndsm_src: rasterio.io.DatasetReader,
+    tile_affine: Affine,
+    size: int,
+) -> np.ndarray:
+    """Resample the DEM/nDSM onto the tile's DOP grid (size × size).
+
+    Uses rasterio's WarpedVRT with the *tile's* affine + (size × size) as
+    explicit output geometry. Bilinear resampling because DEM is continuous
+    data — nearest would create blocky thresholds when filtering by height.
+    Pixels outside the source raster come back as the VRT's NoData value
+    (typically 0 for elevation services), which the modality filter treats
+    as a neutral failure rather than as "tall".
+    """
+    with WarpedVRT(
+        ndsm_src,
+        crs=ndsm_src.crs,
+        transform=tile_affine,
+        width=size,
+        height=size,
+        resampling=Resampling.bilinear,
+    ) as vrt:
+        ndsm = vrt.read(1)
+    return ndsm.astype(np.float32, copy=False)
+
+
 def iter_tiles(
     vrt_path: Path,
     cfg: TileConfig,
     *,
     safe_center_nodata_threshold: float = 0.0,
+    read_nir: bool = False,
+    ndsm_path: Path | None = None,
 ) -> Iterator[Tile | NodataTile]:
+    """Iterate tiles from the DOP VRT, optionally enriched with NIR/nDSM.
+
+    - ``read_nir``: pull DOP band 4 (NIR) into ``Tile.nir``. Cheap because
+      it's the same dataset; one extra read per tile.
+    - ``ndsm_path``: a separate DEM/nDSM raster (any CRS, any resolution).
+      The tiler opens it once outside the per-tile loop and resamples per
+      tile via WarpedVRT + bilinear interpolation onto the DOP 0.2 m grid.
+    """
     with rasterio.Env(GDAL_MAX_DATASET_POOL_SIZE=256):
-        with rasterio.open(vrt_path) as src:
-            for tile_row, tile_col, row_off, col_off in iter_grid(src, cfg):
-                window = Window(
-                    col_off=col_off,
-                    row_off=row_off,
-                    width=cfg.size,
-                    height=cfg.size,
-                )
-                tile_affine = src.window_transform(window)
-                dataset_mask = src.dataset_mask(window=window)
-                nodata_mask = dataset_mask == 0
+        ndsm_src = rasterio.open(ndsm_path) if ndsm_path is not None else None
+        try:
+            with rasterio.open(vrt_path) as src:
+                col_offsets = _axis_offsets(src.width, cfg.size, cfg.tile_step)
+                row_offsets = _axis_offsets(src.height, cfg.size, cfg.tile_step)
+                col_ownership = _ownership_intervals(col_offsets, cfg.size, cfg.center_margin)
+                row_ownership = _ownership_intervals(row_offsets, cfg.size, cfg.center_margin)
 
-                if _safe_center_has_nodata(
-                    nodata_mask,
-                    cfg.center_margin,
-                    cfg.size,
-                    safe_center_nodata_threshold,
-                ):
-                    yield NodataTile(
-                        tile_row=tile_row,
-                        tile_col=tile_col,
-                        pixel_origin=(row_off, col_off),
-                        size=cfg.size,
-                        center_margin=cfg.center_margin,
-                        affine=tile_affine,
-                    )
-                    continue
+                read_indexes: list[int] = [1, 2, 3]
+                if read_nir and src.count >= 4:
+                    read_indexes.append(4)
 
-                array_chw = src.read(
-                    indexes=[1, 2, 3],
-                    window=window,
-                    boundless=True,
-                    fill_value=0,
-                )
-                yield Tile(
-                    array=array_chw.transpose(1, 2, 0),
-                    pixel_origin=(row_off, col_off),
-                    size=cfg.size,
-                    center_margin=cfg.center_margin,
-                    affine=tile_affine,
-                    tile_row=tile_row,
-                    tile_col=tile_col,
-                    nodata_mask=nodata_mask,
-                )
+                for tile_row, row_off in enumerate(row_offsets):
+                    owner_r0, owner_r1 = row_ownership[tile_row]
+                    for tile_col, col_off in enumerate(col_offsets):
+                        owner_c0, owner_c1 = col_ownership[tile_col]
+                        window = Window(
+                            col_off=col_off,
+                            row_off=row_off,
+                            width=cfg.size,
+                            height=cfg.size,
+                        )
+                        tile_affine = src.window_transform(window)
+                        dataset_mask = src.dataset_mask(window=window)
+                        nodata_mask = dataset_mask == 0
+
+                        if _safe_center_has_nodata(
+                            nodata_mask,
+                            cfg.center_margin,
+                            cfg.size,
+                            safe_center_nodata_threshold,
+                        ):
+                            yield NodataTile(
+                                tile_row=tile_row,
+                                tile_col=tile_col,
+                                pixel_origin=(row_off, col_off),
+                                size=cfg.size,
+                                center_margin=cfg.center_margin,
+                                affine=tile_affine,
+                            )
+                            continue
+
+                        array_chw = src.read(
+                            indexes=read_indexes,
+                            window=window,
+                            boundless=True,
+                            fill_value=0,
+                        )
+                        rgb = array_chw[:3].transpose(1, 2, 0)
+                        nir_band: np.ndarray | None = None
+                        if read_nir and array_chw.shape[0] >= 4:
+                            nir_band = array_chw[3]
+
+                        ndsm_band: np.ndarray | None = None
+                        if ndsm_src is not None:
+                            ndsm_band = _read_ndsm_for_tile(ndsm_src, tile_affine, cfg.size)
+
+                        yield Tile(
+                            array=rgb,
+                            pixel_origin=(row_off, col_off),
+                            size=cfg.size,
+                            center_margin=cfg.center_margin,
+                            affine=tile_affine,
+                            tile_row=tile_row,
+                            tile_col=tile_col,
+                            nodata_mask=nodata_mask,
+                            ownership_bounds_pixel=(owner_r0, owner_r1, owner_c0, owner_c1),
+                            nir=nir_band,
+                            ndsm=ndsm_band,
+                        )
+        finally:
+            if ndsm_src is not None:
+                ndsm_src.close()
 
 
 def safe_center_polygon(tile: Tile | NodataTile) -> Polygon:

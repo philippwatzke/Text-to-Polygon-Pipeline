@@ -8,24 +8,31 @@ from pathlib import Path
 import geopandas as gpd
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
-from shapely.geometry import box
+from shapely.geometry import Point, box
 from shapely.wkb import loads as wkb_loads
+from shapely.wkb import dumps as wkb_dumps
 
 from ki_geodaten.config import Settings
 from ki_geodaten.jobs.store import (
     get_job,
     get_job_summary,
+    get_missed_objects_for_job,
     get_nodata_for_job,
     get_polygons_for_job,
     insert_job,
+    insert_missed_object,
     list_jobs,
+    delete_missed_object,
+    update_job_label,
     update_status,
     update_missed_estimate,
     validate_bulk,
 )
 from ki_geodaten.models import (
     CreateJobRequest,
+    JobLabelRequest,
     JobStatus,
+    MissedObjectRequest,
     MissedEstimateRequest,
     ValidateBulkRequest,
 )
@@ -35,7 +42,7 @@ logger = logging.getLogger(__name__)
 from ki_geodaten.app.run_metadata import build_run_metadata
 from ki_geodaten.pipeline.dop_client import prepare_download_bbox
 from ki_geodaten.pipeline.exporter import export_two_layer_gpkg
-from ki_geodaten.pipeline.geo_utils import transform_bbox_wgs84_to_utm
+from ki_geodaten.pipeline.geo_utils import transform_bbox_wgs84_to_utm, transformer_4326_to_25832
 
 router = APIRouter()
 
@@ -53,6 +60,7 @@ def _utm_area_km2(bbox_wgs84: list[float]) -> float:
 def _job_view(job: dict) -> dict:
     fields = (
         "id",
+        "label",
         "prompt",
         "tile_preset",
         "status",
@@ -69,6 +77,7 @@ def _job_view(job: dict) -> dict:
         "missed_estimate",
         "bbox_wgs84",
         "run_metadata",
+        "modality_filter",
     )
     view = {field: job.get(field) for field in fields}
     if view.get("bbox_wgs84"):
@@ -78,6 +87,11 @@ def _job_view(job: dict) -> dict:
             view["run_metadata"] = json.loads(view["run_metadata"])
         except (TypeError, ValueError):
             view["run_metadata"] = None
+    if view.get("modality_filter"):
+        try:
+            view["modality_filter"] = json.loads(view["modality_filter"])
+        except (TypeError, ValueError):
+            view["modality_filter"] = None
     exported = job.get("exported_revision")
     validation = job.get("validation_revision") or 0
     view["export_stale"] = exported is None or exported < validation
@@ -110,11 +124,30 @@ async def create_job(req: CreateJobRequest, request: Request):
     prepared = prepare_download_bbox(
         *utm_bounds,
         preset=req.tile_preset,
-        origin_x=settings.WMS_GRID_ORIGIN_X,
-        origin_y=settings.WMS_GRID_ORIGIN_Y,
+        origin_x=settings.WCS_GRID_ORIGIN_X,
+        origin_y=settings.WCS_GRID_ORIGIN_Y,
     )
+    if req.modality_filter.needs_nir() and not settings.MODALITY_USE_NDVI:
+        raise HTTPException(422, "NDVI filter requested but MODALITY_USE_NDVI is disabled")
+    if req.modality_filter.needs_ndsm() and not settings.MODALITY_USE_NDSM:
+        raise HTTPException(422, "nDSM filter requested but MODALITY_USE_NDSM is disabled")
+    if req.modality_filter.needs_ndsm() and not (
+        settings.DGM_METALINK_URL
+        and settings.DOM_METALINK_URL
+    ):
+        raise HTTPException(
+            422,
+            "nDSM filter requested but DGM_METALINK_URL and DOM_METALINK_URL "
+            "are not configured",
+        )
+
     job_id = str(uuid.uuid4())
-    run_metadata = build_run_metadata(settings, tile_preset=req.tile_preset)
+    modality_filter_dict = req.modality_filter.model_dump()
+    run_metadata = build_run_metadata(
+        settings,
+        tile_preset=req.tile_preset,
+        extra={"modality_filter": modality_filter_dict},
+    )
     insert_job(
         request.app.state.db_path,
         job_id=job_id,
@@ -123,6 +156,7 @@ async def create_job(req: CreateJobRequest, request: Request):
         bbox_utm_snapped=list(prepared.aoi_bbox),
         tile_preset=req.tile_preset,
         run_metadata=run_metadata,
+        modality_filter=modality_filter_dict if req.modality_filter.is_active() else None,
     )
     return {"id": job_id, "status": "PENDING"}
 
@@ -148,6 +182,16 @@ async def get_job_summary_endpoint(job_id: str, request: Request):
     return summary
 
 
+@router.patch("/jobs/{job_id}/label")
+def update_job_label_endpoint(job_id: str, req: JobLabelRequest, request: Request):
+    job = get_job(request.app.state.db_path, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    update_job_label(request.app.state.db_path, job_id, req.label)
+    updated = get_job(request.app.state.db_path, job_id)
+    return _job_view(updated)
+
+
 @router.post("/jobs/{job_id}/missed_estimate")
 def update_missed_estimate_endpoint(
     job_id: str,
@@ -163,6 +207,47 @@ def update_missed_estimate_endpoint(
         req.missed_estimate,
     )
     return {"missed_estimate": req.missed_estimate}
+
+
+@router.post("/jobs/{job_id}/missed_objects")
+def create_missed_object(job_id: str, req: MissedObjectRequest, request: Request):
+    job = get_job(request.app.state.db_path, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in {"READY_FOR_REVIEW", "EXPORTED"}:
+        raise HTTPException(409, "job status does not allow missed object annotation")
+
+    transformer = transformer_4326_to_25832()
+    x, y = transformer.transform(req.lon, req.lat)
+    point = Point(x, y)
+    if not box(*json.loads(job["bbox_utm_snapped"])).covers(point):
+        raise HTTPException(422, "missed object must be inside the job bbox")
+
+    missed_id = insert_missed_object(
+        request.app.state.db_path,
+        job_id,
+        geometry_wkb=wkb_dumps(point),
+    )
+    for key in list(request.app.state.geojson_cache.keys()):
+        if key[0] == job_id and key[2] == "missed_objects":
+            del request.app.state.geojson_cache[key]
+    return {"id": missed_id}
+
+
+@router.delete("/jobs/{job_id}/missed_objects/{missed_id}")
+def remove_missed_object(job_id: str, missed_id: int, request: Request):
+    job = get_job(request.app.state.db_path, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job["status"] not in {"READY_FOR_REVIEW", "EXPORTED"}:
+        raise HTTPException(409, "job status does not allow missed object annotation")
+    deleted = delete_missed_object(request.app.state.db_path, job_id, missed_id)
+    if not deleted:
+        raise HTTPException(404, "missed object not found")
+    for key in list(request.app.state.geojson_cache.keys()):
+        if key[0] == job_id and key[2] == "missed_objects":
+            del request.app.state.geojson_cache[key]
+    return {"deleted": deleted}
 
 
 @router.get("/jobs/{job_id}/export.gpkg")
@@ -216,6 +301,12 @@ def _rows_to_gdf(rows: list[dict], kind: str) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame(attrs, geometry=geoms, crs="EPSG:25832")
 
 
+def _missed_rows_to_gdf(rows: list[dict]) -> gpd.GeoDataFrame:
+    attrs = [{"created_at": row["created_at"]} for row in rows]
+    geoms = [wkb_loads(row["geometry_wkb"]) for row in rows]
+    return gpd.GeoDataFrame(attrs, geometry=geoms, crs="EPSG:25832")
+
+
 @router.post("/jobs/{job_id}/export")
 def export_job(job_id: str, request: Request):
     with request.app.state.export_lock:
@@ -232,6 +323,9 @@ def export_job(job_id: str, request: Request):
                 _rows_to_gdf(get_nodata_for_job(request.app.state.db_path, job_id), "nodata"),
                 aoi,
                 out_path,
+                missed_gdf=_missed_rows_to_gdf(
+                    get_missed_objects_for_job(request.app.state.db_path, job_id)
+                ),
             )
         except Exception as exc:  # noqa: BLE001
             # Don't downgrade the job to FAILED — the user must remain able to

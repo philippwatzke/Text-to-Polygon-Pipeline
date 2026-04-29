@@ -68,6 +68,86 @@ def local_mask_nms(
     return kept
 
 
+def _preprocess_rgb_for_sam(
+    array: np.ndarray,
+    *,
+    mode: str = "none",
+    gamma: float = 1.0,
+    brightness: float = 1.0,
+    clahe_clip_limit: float = 2.0,
+    clahe_tile_grid_size: int = 8,
+    clahe_blend: float = 1.0,
+) -> np.ndarray:
+    mode = mode.lower().strip()
+    if mode not in {"none", "gamma", "clahe"}:
+        raise ValueError("mode must be one of: none, gamma, clahe")
+    if gamma <= 0:
+        raise ValueError("gamma must be > 0")
+    if brightness <= 0:
+        raise ValueError("brightness must be > 0")
+    if clahe_clip_limit <= 0:
+        raise ValueError("clahe_clip_limit must be > 0")
+    if clahe_tile_grid_size <= 0:
+        raise ValueError("clahe_tile_grid_size must be > 0")
+    if not 0.0 <= clahe_blend <= 1.0:
+        raise ValueError("clahe_blend must be between 0 and 1")
+
+    rgb = array.astype(np.uint8, copy=False)
+    if mode == "none":
+        return rgb
+
+    if mode == "clahe":
+        enhanced = _clahe_luminance(
+            rgb,
+            clip_limit=clahe_clip_limit,
+            tile_grid_size=clahe_tile_grid_size,
+        )
+        if clahe_blend == 0.0:
+            rgb = rgb.copy()
+        elif clahe_blend == 1.0:
+            rgb = enhanced
+        else:
+            mixed = (
+                rgb.astype(np.float32) * (1.0 - clahe_blend)
+                + enhanced.astype(np.float32) * clahe_blend
+            )
+            rgb = np.clip(np.rint(mixed), 0, 255).astype(np.uint8)
+
+    if gamma == 1.0 and brightness == 1.0:
+        return rgb
+
+    work = rgb.astype(np.float32) / 255.0
+    if gamma != 1.0:
+        work = np.power(work, gamma)
+    if brightness != 1.0:
+        work *= brightness
+    return np.clip(np.rint(work * 255.0), 0, 255).astype(np.uint8)
+
+
+def _clahe_luminance(
+    rgb: np.ndarray,
+    *,
+    clip_limit: float,
+    tile_grid_size: int,
+) -> np.ndarray:
+    try:
+        import cv2
+    except ImportError as exc:
+        raise SegmenterUnavailableError(
+            "SAM image preprocessing mode 'clahe' requires opencv-python-headless."
+        ) from exc
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab)
+    clahe = cv2.createCLAHE(
+        clipLimit=float(clip_limit),
+        tileGridSize=(int(tile_grid_size), int(tile_grid_size)),
+    )
+    enhanced_l = clahe.apply(l_channel)
+    enhanced_lab = cv2.merge((enhanced_l, a_channel, b_channel))
+    return cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2RGB)
+
+
 class Sam3Segmenter:
     """SAM 3 adapter using the official Hugging Face Transformers API."""
 
@@ -80,6 +160,13 @@ class Sam3Segmenter:
         containment_ratio: float = 0.9,
         score_threshold: float = 0.3,
         mask_threshold: float = 0.5,
+        image_preprocess: str = "none",
+        clahe_clip_limit: float = 2.0,
+        clahe_tile_grid_size: int = 8,
+        clahe_blend: float = 1.0,
+        image_gamma: float = 1.0,
+        image_brightness: float = 1.0,
+        local_files_only: bool = True,
         model_cls: Any | None = None,
         processor_cls: Any | None = None,
     ) -> None:
@@ -89,6 +176,13 @@ class Sam3Segmenter:
         self.containment_ratio = containment_ratio
         self.score_threshold = score_threshold
         self.mask_threshold = mask_threshold
+        self.image_preprocess = image_preprocess
+        self.clahe_clip_limit = clahe_clip_limit
+        self.clahe_tile_grid_size = clahe_tile_grid_size
+        self.clahe_blend = clahe_blend
+        self.image_gamma = image_gamma
+        self.image_brightness = image_brightness
+        self.local_files_only = local_files_only
         self._model = None
         self._processor = None
         self._model_cls = model_cls
@@ -108,9 +202,16 @@ class Sam3Segmenter:
 
         model_cls = self._model_cls or Sam3Model
         processor_cls = self._processor_cls or Sam3Processor
+        from_pretrained_kwargs = {"local_files_only": self.local_files_only}
         try:
-            self._processor = processor_cls.from_pretrained(str(self.model_ref))
-            self._model = model_cls.from_pretrained(str(self.model_ref))
+            self._processor = processor_cls.from_pretrained(
+                str(self.model_ref),
+                **from_pretrained_kwargs,
+            )
+            self._model = model_cls.from_pretrained(
+                str(self.model_ref),
+                **from_pretrained_kwargs,
+            )
             self._model.to(self.device)
             self._model.eval()
         except Exception as exc:  # noqa: BLE001
@@ -124,7 +225,35 @@ class Sam3Segmenter:
             self.load()
         import torch
 
-        image = Image.fromarray(tile.array.astype(np.uint8, copy=False), mode="RGB")
+        converted: list[MaskResult] = []
+        for mode in self._preprocess_modes():
+            converted.extend(self._predict_single_pass(tile, prompt, mode, torch))
+
+        return local_mask_nms(
+            converted,
+            iou_threshold=self.iou_threshold,
+            containment_ratio=self.containment_ratio,
+        )
+
+    def _preprocess_modes(self) -> tuple[str, ...]:
+        mode = self.image_preprocess.lower().strip()
+        if mode == "ensemble":
+            return ("none", "clahe")
+        if mode in {"none", "gamma", "clahe"}:
+            return (mode,)
+        raise ValueError("image_preprocess must be one of: none, gamma, clahe, ensemble")
+
+    def _predict_single_pass(self, tile, prompt: str, mode: str, torch) -> list[MaskResult]:
+        image_array = _preprocess_rgb_for_sam(
+            tile.array,
+            mode=mode,
+            gamma=self.image_gamma,
+            brightness=self.image_brightness,
+            clahe_clip_limit=self.clahe_clip_limit,
+            clahe_tile_grid_size=self.clahe_tile_grid_size,
+            clahe_blend=self.clahe_blend,
+        )
+        image = Image.fromarray(image_array, mode="RGB")
         inputs = self._processor(images=image, text=prompt, return_tensors="pt")
         inputs = {
             key: value.to(self.device) if hasattr(value, "to") else value
@@ -146,11 +275,7 @@ class Sam3Segmenter:
                 results.get("scores", []),
                 shape=(tile.array.shape[0], tile.array.shape[1]),
             )
-            return local_mask_nms(
-                converted,
-                iou_threshold=self.iou_threshold,
-                containment_ratio=self.containment_ratio,
-            )
+            return converted
         finally:
             del inputs
 
@@ -163,8 +288,15 @@ class Sam3Segmenter:
 class Sam3TextTokenCounter:
     """Tokenizer-only adapter for the FastAPI process."""
 
-    def __init__(self, model_ref: str | Path, *, processor_cls: Any | None = None) -> None:
+    def __init__(
+        self,
+        model_ref: str | Path,
+        *,
+        local_files_only: bool = True,
+        processor_cls: Any | None = None,
+    ) -> None:
         self.model_ref = model_ref
+        self.local_files_only = local_files_only
         self._processor = None
         self._processor_cls = processor_cls
 
@@ -176,7 +308,10 @@ class Sam3TextTokenCounter:
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError("Transformers SAM3 processor API is unavailable") from exc
         processor_cls = self._processor_cls or Sam3Processor
-        self._processor = processor_cls.from_pretrained(str(self.model_ref))
+        self._processor = processor_cls.from_pretrained(
+            str(self.model_ref),
+            local_files_only=self.local_files_only,
+        )
 
     def __call__(self, prompt: str) -> int:
         if self._processor is None:

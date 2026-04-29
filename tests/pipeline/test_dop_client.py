@@ -1,14 +1,23 @@
-import pytest
-from pathlib import Path
+import io
 import shutil
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+import numpy as np
+import pytest
+import rasterio
+import responses
+from PIL import Image
+from rasterio.enums import ColorInterp
+from rasterio.transform import from_bounds
 
 from ki_geodaten.models import TilePreset
 from ki_geodaten.pipeline.dop_client import (
     DopDownloadError,
     PreparedBBox,
-    _build_vrt,
     _build_session,
-    _png_bytes_to_array,
+    _build_vrt,
+    _wcs_get_coverage_params,
     download_dop20,
     plan_chunk_grid,
     prepare_download_bbox,
@@ -113,7 +122,7 @@ def test_download_error_is_exception_type():
     assert issubclass(DopDownloadError, Exception)
 
 
-def test_wms_session_ignores_environment_proxies(monkeypatch):
+def test_session_ignores_environment_proxies(monkeypatch):
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
 
     session = _build_session()
@@ -121,16 +130,40 @@ def test_wms_session_ignores_environment_proxies(monkeypatch):
     assert session.trust_env is False
 
 
-def test_png_decode_rejects_non_rgba():
-    import io
+def test_session_uses_basic_auth_when_credentials_provided():
+    session = _build_session(username="user", password="secret")
+    assert session.auth is not None
 
-    import numpy as np
-    from PIL import Image
 
-    buf = io.BytesIO()
-    Image.fromarray(np.zeros((2, 2, 3), dtype=np.uint8), mode="RGB").save(buf, format="PNG")
-    with pytest.raises(DopDownloadError, match="Expected RGBA"):
-        _png_bytes_to_array(buf.getvalue())
+def test_session_skips_auth_when_no_credentials():
+    session = _build_session(username="", password="")
+    assert session.auth is None
+
+
+def test_wcs_get_coverage_params_uses_201_subset_form():
+    from ki_geodaten.pipeline.dop_client import ChunkPlan
+
+    chunk = ChunkPlan(row=0, col=0, minx=0.0, miny=0.0, maxx=204.8, maxy=204.8)
+    params = _wcs_get_coverage_params(
+        chunk,
+        coverage_id="by_dop20c",
+        wcs_version="2.0.1",
+        fmt="image/tiff",
+        crs="EPSG:25832",
+    )
+    keys = [name for name, _ in params]
+    values = dict((k, v) for k, v in params if k != "SUBSET")
+    subsets = [v for k, v in params if k == "SUBSET"]
+
+    assert keys.count("SUBSET") == 2
+    assert values["SERVICE"] == "WCS"
+    assert values["VERSION"] == "2.0.1"
+    assert values["REQUEST"] == "GetCoverage"
+    assert values["COVERAGEID"] == "by_dop20c"
+    assert values["FORMAT"] == "image/tiff"
+    assert values["SUBSETTINGCRS"].endswith("/25832")
+    assert values["OUTPUTCRS"].endswith("/25832")
+    assert subsets == ["X(0.0,204.8)", "Y(0.0,204.8)"]
 
 
 def test_chunk_grid_seamless_edges():
@@ -150,7 +183,7 @@ def test_chunk_grid_seamless_edges():
         for value in (chunk.minx, chunk.miny, chunk.maxx, chunk.maxy):
             assert abs(round(value / 0.2) * 0.2 - value) < 1e-9
 
-    by_row = {}
+    by_row: dict = {}
     for chunk in chunks:
         by_row.setdefault(chunk.row, []).append(chunk)
     for row_chunks in by_row.values():
@@ -158,7 +191,7 @@ def test_chunk_grid_seamless_edges():
         for left, right in zip(row_chunks, row_chunks[1:]):
             assert left.maxx == right.minx
 
-    by_col = {}
+    by_col: dict = {}
     for chunk in chunks:
         by_col.setdefault(chunk.col, []).append(chunk)
     for col_chunks in by_col.values():
@@ -183,38 +216,47 @@ def test_chunk_grid_small_bbox_single_chunk():
     assert chunks[0].height_px() == 1024
 
 
+def _make_geotiff_bytes(
+    bbox: tuple[float, float, float, float],
+    *,
+    width: int,
+    height: int,
+    band_count: int = 4,
+    crs: str = "EPSG:25832",
+) -> bytes:
+    """Render an in-memory GeoTIFF that mimics a WCS GetCoverage response."""
+    transform = from_bounds(*bbox, width, height)
+    profile = dict(
+        driver="GTiff",
+        width=width,
+        height=height,
+        count=band_count,
+        dtype="uint8",
+        crs=crs,
+        transform=transform,
+    )
+    with rasterio.io.MemoryFile() as memfile:
+        with memfile.open(**profile) as dst:
+            for band_idx in range(1, band_count + 1):
+                fill = (band_idx * 50) % 256
+                dst.write(np.full((height, width), fill, dtype=np.uint8), band_idx)
+        return memfile.read()
+
+
 def test_download_dop20_http_success():
-    import io
-    from urllib.parse import parse_qs, urlparse
-
-    import numpy as np
-    import rasterio
-    import responses
-    from PIL import Image
-
-    def make_png(width: int, height: int) -> bytes:
-        arr = np.zeros((height, width, 4), dtype=np.uint8)
-        arr[..., 0] = 10
-        arr[..., 1] = 20
-        arr[..., 2] = 30
-        arr[..., 3] = 255
-        buf = io.BytesIO()
-        Image.fromarray(arr, mode="RGBA").save(buf, format="PNG")
-        return buf.getvalue()
-
     def callback(request):
         query = parse_qs(urlparse(request.url).query)
-        assert query["SERVICE"] == ["WMS"]
-        assert query["VERSION"] == ["1.1.1"]
-        assert query["REQUEST"] == ["GetMap"]
-        assert query["LAYERS"] == ["by_dop20c"]
-        assert query["SRS"] == ["EPSG:25832"]
-        assert "CRS" not in query
-        assert query["BBOX"] == ["0.0,0.0,204.8,204.8"]
-        assert query["WIDTH"] == ["1024"]
-        assert query["HEIGHT"] == ["1024"]
-        assert query["FORMAT"] == ["image/png"]
-        return (200, {"Content-Type": "image/png"}, make_png(1024, 1024))
+        assert query["SERVICE"] == ["WCS"]
+        assert query["VERSION"] == ["2.0.1"]
+        assert query["REQUEST"] == ["GetCoverage"]
+        assert query["COVERAGEID"] == ["by_dop20c"]
+        assert query["FORMAT"] == ["image/tiff"]
+        # WCS 2.0.1 emits SUBSET twice
+        assert query["SUBSET"] == ["X(0.0,204.8)", "Y(0.0,204.8)"]
+        assert query["SUBSETTINGCRS"][0].endswith("/25832")
+        assert query["OUTPUTCRS"][0].endswith("/25832")
+        body = _make_geotiff_bytes((0.0, 0.0, 204.8, 204.8), width=1024, height=1024)
+        return (200, {"Content-Type": "image/tiff"}, body)
 
     out_dir = Path("data/dop/test_dop_client_http_success")
     if out_dir.exists():
@@ -224,20 +266,22 @@ def test_download_dop20_http_success():
     with responses.RequestsMock() as rsps:
         rsps.add_callback(
             responses.GET,
-            "http://example/wms",
+            "http://example/wcs",
             callback=callback,
         )
         vrt_path = download_dop20(
             bbox_utm=(0.0, 0.0, 204.8, 204.8),
             out_dir=out_dir,
-            wms_url="http://example/wms",
-            layer="by_dop20c",
-            wms_version="1.1.1",
-            fmt="image/png",
+            wcs_url="http://example/wcs",
+            coverage_id="by_dop20c",
+            wcs_version="2.0.1",
+            fmt="image/tiff",
             crs="EPSG:25832",
             max_pixels=6000,
             origin_x=0.0,
             origin_y=0.0,
+            username="user",
+            password="pw",
         )
 
     assert vrt_path.exists()
@@ -247,12 +291,10 @@ def test_download_dop20_http_success():
     with rasterio.open(tif) as src:
         assert src.crs.to_string() == "EPSG:25832"
         assert src.count == 4
+        assert src.width == 1024
+        assert src.height == 1024
         assert src.bounds.left == pytest.approx(0.0)
         assert src.bounds.right == pytest.approx(204.8)
-        assert src.colorinterp[3].name == "alpha"
-        mask = src.dataset_mask()
-        assert mask.shape == (1024, 1024)
-        assert mask.min() == 255
 
     with rasterio.open(vrt_path) as src:
         assert src.crs.to_string() == "EPSG:25832"
@@ -260,15 +302,143 @@ def test_download_dop20_http_success():
         assert src.bounds.right == pytest.approx(204.8)
 
 
-def test_download_dop20_builds_vrt_without_osgeo(tmp_path, monkeypatch):
-    import io
-    import sys
-    from urllib.parse import parse_qs, urlparse
+def test_download_dop20_passes_basic_auth():
+    captured = {}
 
-    import numpy as np
-    import rasterio
-    import responses
-    from PIL import Image
+    def callback(request):
+        captured["auth_header"] = request.headers.get("Authorization")
+        body = _make_geotiff_bytes((0.0, 0.0, 204.8, 204.8), width=1024, height=1024)
+        return (200, {"Content-Type": "image/tiff"}, body)
+
+    out_dir = Path("data/dop/test_dop_client_auth")
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
+
+    with responses.RequestsMock() as rsps:
+        rsps.add_callback(responses.GET, "http://example/wcs", callback=callback)
+        download_dop20(
+            bbox_utm=(0.0, 0.0, 204.8, 204.8),
+            out_dir=out_dir,
+            wcs_url="http://example/wcs",
+            coverage_id="by_dop20c",
+            wcs_version="2.0.1",
+            fmt="image/tiff",
+            crs="EPSG:25832",
+            max_pixels=6000,
+            origin_x=0.0,
+            origin_y=0.0,
+            username="user",
+            password="pw",
+        )
+
+    assert captured["auth_header"] is not None
+    assert captured["auth_header"].startswith("Basic ")
+
+
+def test_download_dop20_fills_wcs_rgb_zero_pixels_from_wms(tmp_path):
+    def make_wcs_with_black_patch() -> bytes:
+        transform = from_bounds(0.0, 0.0, 204.8, 204.8, 1024, 1024)
+        with rasterio.io.MemoryFile() as memfile:
+            with memfile.open(
+                driver="GTiff",
+                width=1024,
+                height=1024,
+                count=4,
+                dtype="uint8",
+                crs="EPSG:25832",
+                transform=transform,
+            ) as dst:
+                rgb = np.full((3, 1024, 1024), 100, dtype=np.uint8)
+                rgb[:, 100:110, 200:210] = 0
+                dst.write(rgb, indexes=[1, 2, 3])
+                dst.write(np.full((1024, 1024), 255, dtype=np.uint8), 4)
+            return memfile.read()
+
+    def make_wms_png() -> bytes:
+        arr = np.zeros((1024, 1024, 4), dtype=np.uint8)
+        arr[..., 0] = 11
+        arr[..., 1] = 22
+        arr[..., 2] = 33
+        arr[..., 3] = 255
+        buf = io.BytesIO()
+        Image.fromarray(arr, mode="RGBA").save(buf, format="PNG")
+        return buf.getvalue()
+
+    with responses.RequestsMock() as rsps:
+        rsps.add(
+            responses.GET,
+            "http://example/wcs",
+            body=make_wcs_with_black_patch(),
+            status=200,
+            content_type="image/tiff",
+        )
+        rsps.add(
+            responses.GET,
+            "http://example/wms",
+            body=make_wms_png(),
+            status=200,
+            content_type="image/png",
+        )
+        download_dop20(
+            bbox_utm=(0.0, 0.0, 204.8, 204.8),
+            out_dir=tmp_path,
+            wcs_url="http://example/wcs",
+            coverage_id="by_dop20c",
+            wcs_version="2.0.1",
+            fmt="image/tiff",
+            crs="EPSG:25832",
+            max_pixels=6000,
+            origin_x=0.0,
+            origin_y=0.0,
+            fill_rgb_zero_with_wms=True,
+            wms_url="http://example/wms",
+            wms_layer="by_dop20c",
+        )
+
+    with rasterio.open(tmp_path / "chunk_0_0.tif") as src:
+        assert src.read(1)[105, 205] == 11
+        assert src.read(2)[105, 205] == 22
+        assert src.read(3)[105, 205] == 33
+        assert src.read(1)[50, 50] == 100
+
+
+def test_download_dop20_rejects_xml_exception_report():
+    xml_body = b"""<?xml version='1.0'?>
+<ows:ExceptionReport xmlns:ows='http://www.opengis.net/ows/2.0'>
+  <ows:Exception exceptionCode='InvalidParameterValue'/>
+</ows:ExceptionReport>"""
+
+    out_dir = Path("data/dop/test_dop_client_xml_error")
+    if out_dir.exists():
+        shutil.rmtree(out_dir)
+    out_dir.mkdir(parents=True)
+
+    with responses.RequestsMock() as rsps:
+        rsps.add(
+            responses.GET,
+            "http://example/wcs",
+            body=xml_body,
+            status=200,
+            content_type="text/xml",
+        )
+        with pytest.raises(DopDownloadError, match="non-tiff"):
+            download_dop20(
+                bbox_utm=(0.0, 0.0, 204.8, 204.8),
+                out_dir=out_dir,
+                wcs_url="http://example/wcs",
+                coverage_id="by_dop20c",
+                wcs_version="2.0.1",
+                fmt="image/tiff",
+                crs="EPSG:25832",
+                max_pixels=6000,
+                origin_x=0.0,
+                origin_y=0.0,
+            )
+
+
+def test_download_dop20_builds_vrt_without_osgeo(tmp_path, monkeypatch):
+    import sys
 
     class BlockOsgeoImporter:
         def find_spec(self, fullname, path=None, target=None):
@@ -281,28 +451,20 @@ def test_download_dop20_builds_vrt_without_osgeo(tmp_path, monkeypatch):
     monkeypatch.syspath_prepend(str(tmp_path / "empty_import_path"))
     sys.meta_path.insert(0, blocker)
 
-    def make_png() -> bytes:
-        arr = np.zeros((1024, 1024, 4), dtype=np.uint8)
-        arr[..., 3] = 255
-        buf = io.BytesIO()
-        Image.fromarray(arr, mode="RGBA").save(buf, format="PNG")
-        return buf.getvalue()
-
     def callback(request):
-        query = parse_qs(urlparse(request.url).query)
-        assert query["SRS"] == ["EPSG:25832"]
-        return (200, {"Content-Type": "image/png"}, make_png())
+        body = _make_geotiff_bytes((0.0, 0.0, 204.8, 204.8), width=1024, height=1024)
+        return (200, {"Content-Type": "image/tiff"}, body)
 
     try:
         with responses.RequestsMock() as rsps:
-            rsps.add_callback(responses.GET, "http://example/wms", callback=callback)
+            rsps.add_callback(responses.GET, "http://example/wcs", callback=callback)
             vrt_path = download_dop20(
                 bbox_utm=(0.0, 0.0, 204.8, 204.8),
                 out_dir=tmp_path,
-                wms_url="http://example/wms",
-                layer="by_dop20c",
-                wms_version="1.1.1",
-                fmt="image/png",
+                wcs_url="http://example/wcs",
+                coverage_id="by_dop20c",
+                wcs_version="2.0.1",
+                fmt="image/tiff",
                 crs="EPSG:25832",
                 max_pixels=6000,
                 origin_x=0.0,
@@ -313,16 +475,11 @@ def test_download_dop20_builds_vrt_without_osgeo(tmp_path, monkeypatch):
             assert src.count == 4
             assert src.width == 1024
             assert src.height == 1024
-            assert src.dataset_mask().min() == 255
     finally:
         sys.meta_path.remove(blocker)
 
 
 def test_build_vrt_mosaics_adjacent_chunks(tmp_path):
-    import numpy as np
-    import rasterio
-    from rasterio.transform import from_bounds
-
     left = tmp_path / "left.tif"
     right = tmp_path / "right.tif"
     for path, bbox, value in (
@@ -352,3 +509,55 @@ def test_build_vrt_mosaics_adjacent_chunks(tmp_path):
         assert src.bounds.left == pytest.approx(0.0)
         assert src.bounds.right == pytest.approx(409.6)
         assert src.read(1, window=((0, 1), (1023, 1025))).tolist() == [[10, 20]]
+
+
+def test_build_vrt_treats_fourth_wcs_band_as_data_not_alpha(tmp_path):
+    path = tmp_path / "wcs_rgb_ir.tif"
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        width=1024,
+        height=1024,
+        count=4,
+        dtype="uint8",
+        crs="EPSG:25832",
+        transform=from_bounds(0.0, 0.0, 204.8, 204.8, 1024, 1024),
+    ) as dst:
+        dst.write(np.full((3, 1024, 1024), 128, dtype=np.uint8), indexes=[1, 2, 3])
+        dst.write(np.zeros((1024, 1024), dtype=np.uint8), 4)
+        dst.colorinterp = (
+            ColorInterp.red,
+            ColorInterp.green,
+            ColorInterp.blue,
+            ColorInterp.alpha,
+        )
+
+    vrt_path = tmp_path / "out.vrt"
+    _build_vrt(vrt_path, [path], crs="EPSG:25832")
+
+    with rasterio.open(vrt_path) as src:
+        assert src.colorinterp[3] == ColorInterp.undefined
+        assert np.all(src.dataset_mask(window=((320, 704), (320, 704))) == 255)
+
+
+def test_build_vrt_supports_three_band_output(tmp_path):
+    left = tmp_path / "left.tif"
+    with rasterio.open(
+        left,
+        "w",
+        driver="GTiff",
+        width=1024,
+        height=1024,
+        count=3,
+        dtype="uint8",
+        crs="EPSG:25832",
+        transform=from_bounds(0.0, 0.0, 204.8, 204.8, 1024, 1024),
+    ) as dst:
+        dst.write(np.full((3, 1024, 1024), 50, dtype=np.uint8), indexes=[1, 2, 3])
+
+    vrt_path = tmp_path / "out.vrt"
+    _build_vrt(vrt_path, [left], crs="EPSG:25832")
+
+    with rasterio.open(vrt_path) as src:
+        assert src.count == 3

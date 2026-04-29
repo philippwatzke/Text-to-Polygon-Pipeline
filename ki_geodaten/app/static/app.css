@@ -36,7 +36,9 @@ button, select, textarea, input {
 }
 
 #review-panel,
-#compare-panel {
+#missed-panel,
+#compare-panel,
+#job-panel {
   border-top: 1px solid #e5e7eb;
   border-bottom: 1px solid #e5e7eb;
   padding: 10px 0;
@@ -58,11 +60,13 @@ button, select, textarea, input {
   justify-content: flex-start;
 }
 
-#score-filter {
+#score-filter,
+#segment-opacity {
   width: 100%;
 }
 
-#score-value {
+#score-value,
+#segment-opacity-value {
   font-variant-numeric: tabular-nums;
 }
 
@@ -72,52 +76,66 @@ button, select, textarea, input {
   line-height: 1.35;
 }
 
-#missed-estimate {
-  box-sizing: border-box;
-  width: 88px;
+.hint {
+  color: #667085;
+  font-size: 12px;
+  line-height: 1.35;
+  margin: 6px 0;
 }
 
-#compare-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-height: 240px;
-  overflow: auto;
-}
-
-.compare-card {
-  border: 1px solid #d0d5dd;
-  border-radius: 6px;
-  padding: 8px;
+#missed-stats {
+  color: #475467;
   font-size: 13px;
   line-height: 1.35;
 }
 
-.compare-card header {
+.active-mode {
+  background: #111827;
+  color: white;
+}
+
+#compare-list {
+  max-height: 240px;
+  overflow: auto;
+}
+
+.compare-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.compare-table th,
+.compare-table td {
+  border-bottom: 1px solid #e5e7eb;
+  padding: 5px 4px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.compare-table th:first-child,
+.compare-table td:first-child {
+  text-align: left;
+  white-space: normal;
+  min-width: 120px;
+}
+
+.compare-subtitle,
+.job-meta,
+#job-count {
+  color: #667085;
+  font-size: 12px;
+}
+
+.job-filter-row {
   display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: 8px;
-  margin-bottom: 6px;
+  gap: 12px;
+  flex-wrap: wrap;
 }
 
-.compare-title {
-  font-weight: 700;
-  word-break: break-word;
-}
-
-.compare-subtitle {
-  color: #667085;
-}
-
-.compare-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 4px 10px;
-}
-
-.compare-grid span:nth-child(odd) {
-  color: #667085;
+#job-search {
+  box-sizing: border-box;
+  width: 100%;
 }
 
 #map {
@@ -132,6 +150,32 @@ button, select, textarea, input {
   border-top: 1px solid #e5e7eb;
   padding: 8px 0;
   cursor: pointer;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 6px;
+  align-items: start;
+}
+
+.job.active {
+  background: #eff6ff;
+  margin-inline: -6px;
+  padding-inline: 6px;
+}
+
+.job-title {
+  font-weight: 700;
+  word-break: break-word;
+}
+
+.job-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.job-actions button,
+.compare-remove {
+  font-size: 12px;
+  padding: 2px 6px;
 }
 
 @media (max-width: 760px) {

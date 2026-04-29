@@ -72,7 +72,10 @@ def _default_token_counter(settings: Settings) -> TokenCounter:
     try:
         from ki_geodaten.pipeline.segmenter import Sam3TextTokenCounter
 
-        counter = Sam3TextTokenCounter(settings.SAM3_MODEL_ID)
+        counter = Sam3TextTokenCounter(
+            settings.SAM3_MODEL_ID,
+            local_files_only=settings.SAM3_LOCAL_FILES_ONLY,
+        )
         counter.load()
         return counter
     except Exception as exc:  # noqa: BLE001

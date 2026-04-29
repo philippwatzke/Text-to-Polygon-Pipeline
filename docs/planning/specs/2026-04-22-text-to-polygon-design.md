@@ -1,16 +1,65 @@
 # Text-to-Polygon Pipeline — Design Spec
 
 **Datum (Entwurf):** 2026-04-22
-**Letzte Revision:** 2026-04-25
+**Letzte Revision:** 2026-04-29 (Multimodal-Filter NDVI/nDSM)
 **Status:** Entwurf zur Implementierung
 **Scope:** Prototyp (Exploration), Bayern, lokal auf RTX 4070 / 12 GB VRAM / 64 GB RAM
 
-**Revision 2026-04-25:** DOP20-Bezug wurde von WCS auf den verifizierten LDBV
-OpenData WMS umgestellt (`https://geoservices.bayern.de/od/wms/dop/v1/dop20`,
-Layer `by_dop20c`, WMS 1.1.1, `SRS=EPSG:25832`, `FORMAT=image/png`).
-Alle älteren WCS-Bezüge in diesem Entwurf sind historisch zu lesen und werden
-durch die WMS-Verifikation in `docs/wms-verification.md` sowie den
-Implementierungsplan vom 2026-04-24 ersetzt.
+**Revision 2026-04-29 (Multimodal-Filter):** Pipeline um zwei Post-Segmentierungs-Filter
+erweitert.
+
+**Nachtrag:** Bayern stellt DGM und DOM separat bereit; das nDSM wird deshalb
+lokal als `DOM - DGM` abgeleitet. Die Konfiguration erfolgt ueber
+`DGM_METALINK_*`- und `DOM_METALINK_*`-Settings, nicht ueber eine einzelne
+fertige `NDSM_*`-Coverage oder einen zusaetzlichen DGM-WCS-Zugang.
+
+- **NDVI** wird aus DOP20 Band 4 (NIR) und Band 1 (R) berechnet — keine zusätzliche
+  Datenakquise nötig, weil der LDBV INSPIRE-WCS bereits 4 Bänder (R/G/B/IR) liefert
+  (DescribeCoverage 2026-04-28). Der Tiler liest Band 4 nur, wenn der Job einen
+  NDVI-Schwellwert setzt (`tile.nir`-Feld).
+- **nDSM** wird lokal als **DOM minus DGM** berechnet. `dem_client.py` laedt DOM
+  und DGM als OpenData-GeoTIFF-Kacheln, baut lokale VRTs, resamplet DGM auf das DOM-Grid,
+  schreibt `ndsm.tif`, und der Tiler resamplet dieses per WarpedVRT/Bilinear
+  auf das DOP-0.2-m-Grid pro Tile (`tile.ndsm`).
+- Der Filter sitzt in `pipeline/modality_filter.py` zwischen `keep_center_only`
+  und `masks_to_polygons`. Pro Maske wird der **Mittelwert** über die Maskenpixel
+  in NDVI bzw. nDSM gegen die jobspezifischen Bounds geprüft. Default: kein Filter.
+  Eine fehlende Modalitaet (z. B. OpenData-Kacheln nicht erreichbar) wird als
+  „bound bypassed" behandelt, nicht als „alles ablehnen" — Pipeline bleibt robust.
+- API: `CreateJobRequest.modality_filter: ModalityFilter` mit optionalen
+  `ndvi_min/max` (∈ [-1, 1]) und `ndsm_min/max` (Meter). Persistiert als JSON
+  in `jobs.modality_filter` plus eingebettet in `run_metadata.modality_filter`
+  für Reproduzierbarkeit.
+- Architekturelle Begründung: SAM 3 ist auf RGB trainiert; multimodale
+  Information **nach** der Segmentierung als Filter zu nutzen (statt sie SAM
+  als Input zu geben) wahrt die Zero-Shot-Eigenschaft des Modells und macht
+  den methodischen Beitrag der Thesis sauber unterscheidbar von SAM selbst.
+
+**Revision 2026-04-28:** Rückkehr von WMS auf WCS für die Pipeline-Eingabe.
+Begründung: WMS ist ein Rendering-Protokoll (Server liefert ein gemaltes
+Bild, das eine Render-Pipeline durchlaufen hat); WCS liefert die rohe
+Coverage in nativem Datentyp. Für den methodischen Anspruch („SAM 3.1
+sieht die Daten so wie sie der LDBV liefert") ist WCS strukturell richtig,
+und multimodale Erweiterungen (nDSM als float32, evtl. CIR/NIR mit höherer
+Bit-Tiefe) gehen ohnehin nur über WCS. Die Auth-Wartezeit war der
+ursprüngliche Migrationsgrund auf WMS und ist mittlerweile aufgelöst.
+
+- WCS_URL: `https://geoservices.bayern.de/pro/wcs/dop/v1/wcs_inspire_dop20`
+- WCS_VERSION: `2.0.1`
+- WCS_COVERAGE_ID: `by_dop20c` (DescribeCoverage-verifiziert)
+- WCS_FORMAT: `image/tiff`
+- WCS_CRS: `EPSG:25832`
+- Auth: HTTP Basic, `WCS_USERNAME`/`WCS_PASSWORD` in `.env`
+- Empirische Verifikation: `docs/wcs-verification.md`
+
+Der WMS bleibt im Codebase als reiner UI-Basemap für die Leaflet-Karte,
+verifiziert dafür unter `docs/wms-display-verification.md`. Er wird **nicht
+mehr** für Modell-Eingaben benutzt.
+
+**Revision 2026-04-25 (historisch):** DOP20-Bezug wurde von WCS auf den
+verifizierten LDBV OpenData WMS umgestellt. Diese Revision war ein
+Übergangs-Workaround während der Wartezeit auf den WCS-Auth-Zugang und
+ist mit Revision 2026-04-28 wieder zurückgenommen.
 
 ---
 

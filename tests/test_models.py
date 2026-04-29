@@ -1,7 +1,14 @@
 # tests/test_models.py
 import pytest
 from pydantic import ValidationError
-from ki_geodaten.models import BBox, CreateJobRequest, TilePreset, ValidateBulkRequest, ValidationUpdate
+from ki_geodaten.models import (
+    BBox,
+    CreateJobRequest,
+    JobLabelRequest,
+    TilePreset,
+    ValidateBulkRequest,
+    ValidationUpdate,
+)
 
 def test_bbox_accepts_valid():
     b = BBox(minx=11.0, miny=48.0, maxx=11.1, maxy=48.1)
@@ -25,3 +32,7 @@ def test_validate_bulk_request():
 def test_validation_update_rejects_unknown_value():
     with pytest.raises(ValidationError):
         ValidationUpdate(pid=1, validation="MAYBE")
+
+def test_job_label_request_normalizes_blank_labels():
+    assert JobLabelRequest(label="  SAM only  ").label == "SAM only"
+    assert JobLabelRequest(label="   ").label is None

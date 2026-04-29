@@ -96,3 +96,43 @@ def build_nodata_geojson(
     aoi_utm: tuple[float, float, float, float],
 ) -> str:
     return json.dumps(build_nodata_feature_collection(rows, aoi_utm=aoi_utm))
+
+
+def _transform_point_precision(geom, aoi_utm_polygon):
+    if geom.is_empty or not aoi_utm_polygon.covers(geom):
+        return None
+    transformed = _transform_to_4326(geom)
+    return shapely.set_precision(transformed, grid_size=_PRECISION_DEG)
+
+
+def build_missed_objects_feature_collection(
+    rows: Iterable[dict],
+    *,
+    aoi_utm: tuple[float, float, float, float],
+) -> dict:
+    aoi = box(*aoi_utm)
+    features: list[dict] = []
+    for row in rows:
+        geom = wkb_loads(row["geometry_wkb"])
+        transformed = _transform_point_precision(geom, aoi)
+        if transformed is None:
+            continue
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(transformed),
+                "properties": {
+                    "id": row["id"],
+                    "created_at": row["created_at"],
+                },
+            }
+        )
+    return _feature_collection(features)
+
+
+def build_missed_objects_geojson(
+    rows: Iterable[dict],
+    *,
+    aoi_utm: tuple[float, float, float, float],
+) -> str:
+    return json.dumps(build_missed_objects_feature_collection(rows, aoi_utm=aoi_utm))

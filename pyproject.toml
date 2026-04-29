@@ -19,6 +19,7 @@ dependencies = [
     "requests",
     "urllib3>=2",
     "pillow",
+    "opencv-python-headless>=4.11,<4.13",
     "fiona",
     "transformers>=5.6",
     "accelerate",

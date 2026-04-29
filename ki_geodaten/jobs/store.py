@@ -11,6 +11,7 @@ from ki_geodaten.models import JobStatus, TilePreset
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id                TEXT PRIMARY KEY,
+    label             TEXT,
     prompt            TEXT NOT NULL,
     bbox_wgs84        TEXT NOT NULL,
     bbox_utm_snapped  TEXT NOT NULL,
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     exported_revision   INTEGER,
     missed_estimate   INTEGER,
     run_metadata      TEXT,
+    modality_filter   TEXT,
     created_at        TEXT NOT NULL,
     started_at        TEXT,
     finished_at       TEXT
@@ -59,6 +61,14 @@ CREATE TABLE IF NOT EXISTS nodata_regions (
                           'OOM','INFERENCE_ERROR','INVALID_GEOMETRY','NODATA_PIXELS'))
 );
 CREATE INDEX IF NOT EXISTS idx_nodata_job ON nodata_regions(job_id);
+
+CREATE TABLE IF NOT EXISTS missed_objects (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id           TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    geometry_wkb     BLOB NOT NULL,
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_missed_objects_job ON missed_objects(job_id);
 """
 
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
@@ -89,6 +99,10 @@ def init_schema(db_path: Path) -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN missed_estimate INTEGER")
         if "run_metadata" not in cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN run_metadata TEXT")
+        if "modality_filter" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN modality_filter TEXT")
+        if "label" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN label TEXT")
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -98,12 +112,13 @@ def insert_job(
     bbox_wgs84: list[float], bbox_utm_snapped: list[float],
     tile_preset: TilePreset,
     run_metadata: dict | None = None,
+    modality_filter: dict | None = None,
 ) -> None:
     with connect(db_path) as conn:
         conn.execute(
             "INSERT INTO jobs(id,prompt,bbox_wgs84,bbox_utm_snapped,tile_preset,"
-            "status,run_metadata,created_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            "status,run_metadata,modality_filter,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (
                 job_id,
                 prompt,
@@ -112,6 +127,7 @@ def insert_job(
                 str(tile_preset),
                 JobStatus.PENDING,
                 json.dumps(run_metadata) if run_metadata is not None else None,
+                json.dumps(modality_filter) if modality_filter is not None else None,
                 _utc_iso(),
             ),
         )
@@ -197,11 +213,58 @@ def get_polygons_for_job(db_path: Path, job_id: str) -> list[dict]:
         ).fetchall()
     return [dict(r) for r in rows]
 
+def replace_polygons_for_job(db_path: Path, job_id: str, polys: list[dict]) -> None:
+    with connect(db_path) as conn:
+        conn.execute("BEGIN")
+        conn.execute("DELETE FROM polygons WHERE job_id = ?", (job_id,))
+        if polys:
+            conn.executemany(
+                "INSERT INTO polygons(job_id,geometry_wkb,score,source_tile_row,source_tile_col)"
+                " VALUES (?,?,?,?,?)",
+                [(job_id, p["geometry_wkb"], p["score"],
+                  p["source_tile_row"], p["source_tile_col"]) for p in polys],
+            )
+        conn.execute("COMMIT")
+
 def get_nodata_for_job(db_path: Path, job_id: str) -> list[dict]:
     with connect(db_path) as conn:
         rows = conn.execute(
             "SELECT id,geometry_wkb,tile_row,tile_col,reason"
             " FROM nodata_regions WHERE job_id = ?",
+            (job_id,),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+def insert_missed_object(db_path: Path, job_id: str, *, geometry_wkb: bytes) -> int:
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            "INSERT INTO missed_objects(job_id,geometry_wkb,created_at) VALUES (?,?,?)",
+            (job_id, geometry_wkb, _utc_iso()),
+        )
+        conn.execute(
+            "UPDATE jobs SET validation_revision = validation_revision + 1 WHERE id = ?",
+            (job_id,),
+        )
+        return int(cursor.lastrowid)
+
+def delete_missed_object(db_path: Path, job_id: str, missed_id: int) -> int:
+    with connect(db_path) as conn:
+        cursor = conn.execute(
+            "DELETE FROM missed_objects WHERE id = ? AND job_id = ?",
+            (missed_id, job_id),
+        )
+        deleted = max(int(cursor.rowcount or 0), 0)
+        if deleted:
+            conn.execute(
+                "UPDATE jobs SET validation_revision = validation_revision + 1 WHERE id = ?",
+                (job_id,),
+            )
+        return deleted
+
+def get_missed_objects_for_job(db_path: Path, job_id: str) -> list[dict]:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            "SELECT id,geometry_wkb,created_at FROM missed_objects WHERE job_id = ? ORDER BY id",
             (job_id,),
         ).fetchall()
     return [dict(r) for r in rows]
@@ -237,6 +300,13 @@ def update_missed_estimate(db_path: Path, job_id: str, missed_estimate: int | No
             (missed_estimate, job_id),
         )
 
+def update_job_label(db_path: Path, job_id: str, label: str | None) -> None:
+    with connect(db_path) as conn:
+        conn.execute(
+            "UPDATE jobs SET label = ? WHERE id = ?",
+            (label, job_id),
+        )
+
 def get_job_summary(db_path: Path, job_id: str) -> dict | None:
     with connect(db_path) as conn:
         job = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
@@ -268,17 +338,28 @@ def get_job_summary(db_path: Path, job_id: str) -> dict | None:
             """,
             (job_id,),
         ).fetchone()
+        missed_marked = conn.execute(
+            "SELECT COUNT(*) AS total FROM missed_objects WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()["total"]
 
     total = int(counts["total"] or 0)
     accepted = int(counts["accepted"] or 0)
     rejected = int(counts["rejected"] or 0)
-    missed = job["missed_estimate"]
+    missed = int(missed_marked or 0)
+    missed_source = "marked"
+    if missed == 0 and job["missed_estimate"] is not None:
+        missed = int(job["missed_estimate"])
+        missed_source = "estimate"
+    elif missed == 0:
+        missed_source = None
     recall_estimate = None
-    if missed is not None and accepted + int(missed) > 0:
-        recall_estimate = accepted / (accepted + int(missed))
+    if missed_source is not None and accepted + missed > 0:
+        recall_estimate = accepted / (accepted + missed)
     precision_review = accepted / total if total else None
     return {
         "id": job["id"],
+        "label": job["label"],
         "prompt": job["prompt"],
         "tile_preset": job["tile_preset"],
         "status": job["status"],
@@ -290,7 +371,10 @@ def get_job_summary(db_path: Path, job_id: str) -> dict | None:
         "export_stale": job["exported_revision"] is None
         or job["exported_revision"] < job["validation_revision"],
         "created_at": job["created_at"],
-        "missed_estimate": missed,
+        "missed_estimate": job["missed_estimate"],
+        "missed_marked": int(missed_marked or 0),
+        "missed_for_recall": missed if missed_source is not None else None,
+        "missed_source": missed_source,
         "total": total,
         "accepted": accepted,
         "rejected": rejected,

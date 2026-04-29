@@ -6,6 +6,7 @@ from ki_geodaten.pipeline.segmenter import (
     Sam3Segmenter,
     Sam3TextTokenCounter,
     SegmenterUnavailableError,
+    _preprocess_rgb_for_sam,
     local_mask_nms,
 )
 
@@ -68,9 +69,10 @@ def test_sam3_segmenter_missing_checkpoint_fails_fast(tmp_path):
 
 class _FakeModel:
     @classmethod
-    def from_pretrained(cls, model_ref):
+    def from_pretrained(cls, model_ref, **kwargs):
         instance = cls()
         instance.model_ref = model_ref
+        instance.from_pretrained_kwargs = kwargs
         return instance
 
     def to(self, device):
@@ -82,6 +84,7 @@ class _FakeModel:
         return self
 
     def __call__(self, **inputs):
+        self.calls = getattr(self, "calls", 0) + 1
         return {"raw": inputs}
 
 
@@ -99,14 +102,16 @@ class _FakeProcessor:
     tokenizer = _FakeTokenizer()
 
     @classmethod
-    def from_pretrained(cls, model_ref):
+    def from_pretrained(cls, model_ref, **kwargs):
         instance = cls()
         instance.model_ref = model_ref
+        instance.from_pretrained_kwargs = kwargs
         return instance
 
     def __call__(self, images, text, return_tensors):
         import torch
 
+        self.calls = getattr(self, "calls", 0) + 1
         assert images.size == (100, 100)
         assert text == "building"
         assert return_tensors == "pt"
@@ -122,7 +127,7 @@ class _FakeProcessor:
         import torch
 
         mask = torch.zeros((1, 100, 100), dtype=torch.bool)
-        mask[10:30, 20:40] = True
+        mask[:, 10:30, 20:40] = True
         return [
             {
                 "masks": mask,
@@ -152,6 +157,84 @@ def test_sam3_segmenter_converts_transformers_results():
     assert out[0].mask.dtype == bool
     assert out[0].mask.shape == (100, 100)
     assert out[0].box_pixel == (10, 20, 30, 40)
+    assert segmenter._processor.from_pretrained_kwargs == {"local_files_only": True}
+    assert segmenter._model.from_pretrained_kwargs == {"local_files_only": True}
+
+
+def test_sam3_segmenter_ensemble_runs_original_and_clahe_then_deduplicates():
+    segmenter = Sam3Segmenter(
+        "facebook/sam3",
+        device="cpu",
+        image_preprocess="ensemble",
+        model_cls=_FakeModel,
+        processor_cls=_FakeProcessor,
+    )
+    tile = type(
+        "Tile",
+        (),
+        {"array": np.zeros((100, 100, 3), dtype=np.uint8)},
+    )()
+
+    out = segmenter.predict(tile, "building")
+
+    assert len(out) == 1
+    assert segmenter._processor.calls == 2
+    assert segmenter._model.calls == 2
+
+
+def test_preprocess_rgb_for_sam_gamma_lifts_shadows_more_than_highlights():
+    arr = np.asarray([[[40, 80, 200]]], dtype=np.uint8)
+
+    out = _preprocess_rgb_for_sam(arr, mode="gamma", gamma=0.9)
+
+    assert out[0, 0, 0] > arr[0, 0, 0]
+    assert out[0, 0, 1] > arr[0, 0, 1]
+    assert out[0, 0, 2] > arr[0, 0, 2]
+    assert int(out[0, 0, 0]) - int(arr[0, 0, 0]) > int(out[0, 0, 2]) - int(arr[0, 0, 2])
+
+
+def test_preprocess_rgb_for_sam_identity_returns_uint8_view():
+    arr = np.asarray([[[40, 80, 200]]], dtype=np.uint8)
+
+    out = _preprocess_rgb_for_sam(arr, mode="none", gamma=0.9, brightness=1.2)
+
+    assert out.dtype == np.uint8
+    assert np.array_equal(out, arr)
+
+
+def test_preprocess_rgb_for_sam_clahe_changes_luminance_without_shape_or_dtype_change():
+    arr = np.zeros((64, 64, 3), dtype=np.uint8)
+    arr[:, :32] = [35, 35, 35]
+    arr[:, 32:] = [90, 90, 90]
+
+    out = _preprocess_rgb_for_sam(
+        arr,
+        mode="clahe",
+        clahe_clip_limit=2.0,
+        clahe_tile_grid_size=4,
+    )
+
+    assert out.shape == arr.shape
+    assert out.dtype == np.uint8
+    assert not np.array_equal(out, arr)
+    assert np.allclose(out[..., 0], out[..., 1], atol=1)
+    assert np.allclose(out[..., 1], out[..., 2], atol=1)
+
+
+def test_preprocess_rgb_for_sam_clahe_blend_preserves_some_original_signal():
+    arr = np.zeros((64, 64, 3), dtype=np.uint8)
+    arr[:, :32] = [35, 35, 35]
+    arr[:, 32:] = [90, 90, 90]
+
+    original = _preprocess_rgb_for_sam(arr, mode="clahe", clahe_blend=0.0)
+    full = _preprocess_rgb_for_sam(arr, mode="clahe", clahe_blend=1.0)
+    blended = _preprocess_rgb_for_sam(arr, mode="clahe", clahe_blend=0.5)
+
+    assert np.array_equal(original, arr)
+    assert not np.array_equal(full, arr)
+    assert np.abs(blended.astype(int) - arr.astype(int)).mean() < np.abs(
+        full.astype(int) - arr.astype(int)
+    ).mean()
 
 
 def test_sam3_text_counter_uses_processor_tokenizer():

@@ -1,10 +1,11 @@
 import json
 
-from shapely.geometry import Polygon
+from shapely.geometry import Point, Polygon
 from shapely.wkb import dumps as wkb_dumps
 
 from ki_geodaten.app.serialization import (
     build_nodata_feature_collection,
+    build_missed_objects_feature_collection,
     build_polygons_feature_collection,
     build_polygons_geojson,
 )
@@ -68,6 +69,23 @@ def test_nodata_geojson_carries_reason():
     rows = [{"id": 9, "geometry_wkb": _poly_wkb(poly), "reason": "OOM"}]
     fc = build_nodata_feature_collection(rows, aoi_utm=_aoi_utm())
     assert fc["features"][0]["properties"] == {"reason": "OOM"}
+
+
+def test_missed_objects_geojson_has_point_ids():
+    rows = [
+        {
+            "id": 7,
+            "geometry_wkb": _poly_wkb(Point(691100, 5335100)),
+            "created_at": "2026-04-27T00:00:00+00:00",
+        }
+    ]
+    fc = build_missed_objects_feature_collection(rows, aoi_utm=_aoi_utm())
+
+    assert fc["features"][0]["geometry"]["type"] == "Point"
+    assert fc["features"][0]["properties"] == {
+        "id": 7,
+        "created_at": "2026-04-27T00:00:00+00:00",
+    }
 
 
 def test_processpool_builder_returns_json_string():

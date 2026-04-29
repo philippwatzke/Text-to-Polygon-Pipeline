@@ -11,10 +11,12 @@ from ki_geodaten.pipeline.merger import extract_polygons
 
 DETECTED_LAYER = "detected_objects"
 NODATA_LAYER = "nodata_regions"
+MISSED_LAYER = "missed_objects"
 CRS = "EPSG:25832"
 
 _EMPTY_DETECTED_COLS = ("score", "source_tile_row", "source_tile_col")
 _EMPTY_NODATA_COLS = ("reason",)
+_EMPTY_MISSED_COLS = ("created_at",)
 _DETECTED_SCHEMA = {
     "geometry": "Polygon",
     "properties": {
@@ -26,6 +28,10 @@ _DETECTED_SCHEMA = {
 _NODATA_SCHEMA = {
     "geometry": "Polygon",
     "properties": {"reason": "str:32"},
+}
+_MISSED_SCHEMA = {
+    "geometry": "Point",
+    "properties": {"created_at": "str:32"},
 }
 
 
@@ -58,6 +64,23 @@ def _clip_and_normalize(gdf: gpd.GeoDataFrame, aoi: BaseGeometry) -> gpd.GeoData
     return gpd.GeoDataFrame(rows, geometry=geometries, crs=CRS)
 
 
+def _clip_points(gdf: gpd.GeoDataFrame, aoi: BaseGeometry) -> gpd.GeoDataFrame:
+    if len(gdf) == 0:
+        return gpd.GeoDataFrame(
+            {column: [] for column in gdf.columns if column != "geometry"},
+            geometry=[],
+            crs=CRS,
+        )
+    clipped = gdf[gdf.geometry.within(aoi) | gdf.geometry.touches(aoi)].copy()
+    if len(clipped) == 0:
+        return gpd.GeoDataFrame(
+            {column: [] for column in gdf.columns if column != "geometry"},
+            geometry=[],
+            crs=CRS,
+        )
+    return clipped
+
+
 def _empty_with_schema(cols: Iterable[str]) -> gpd.GeoDataFrame:
     return gpd.GeoDataFrame({column: [] for column in cols}, geometry=[], crs=CRS)
 
@@ -73,16 +96,23 @@ def export_two_layer_gpkg(
     nodata_gdf: gpd.GeoDataFrame,
     requested_bbox: BaseGeometry,
     out_path: Path,
+    missed_gdf: gpd.GeoDataFrame | None = None,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _unlink_gpkg_family(out_path)
 
     detected = _clip_and_normalize(detected_gdf, requested_bbox)
     nodata = _clip_and_normalize(nodata_gdf, requested_bbox)
+    missed = _clip_points(
+        missed_gdf if missed_gdf is not None else _empty_with_schema(_EMPTY_MISSED_COLS),
+        requested_bbox,
+    )
     if len(detected) == 0:
         detected = _empty_with_schema(_EMPTY_DETECTED_COLS)
     if len(nodata) == 0:
         nodata = _empty_with_schema(_EMPTY_NODATA_COLS)
+    if len(missed) == 0:
+        missed = _empty_with_schema(_EMPTY_MISSED_COLS)
 
     detected.to_file(
         out_path,
@@ -96,5 +126,12 @@ def export_two_layer_gpkg(
         layer=NODATA_LAYER,
         driver="GPKG",
         schema=_NODATA_SCHEMA,
+        engine="fiona",
+    )
+    missed.to_file(
+        out_path,
+        layer=MISSED_LAYER,
+        driver="GPKG",
+        schema=_MISSED_SCHEMA,
         engine="fiona",
     )

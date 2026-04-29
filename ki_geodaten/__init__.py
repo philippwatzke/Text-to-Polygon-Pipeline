@@ -1,0 +1,3 @@
+from ki_geodaten.geospatial_env import configure_geospatial_runtime
+
+configure_geospatial_runtime()

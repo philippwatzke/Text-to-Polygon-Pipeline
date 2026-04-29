@@ -1,11 +1,13 @@
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+import fiona
 from fastapi.testclient import TestClient
 from shapely.geometry import Polygon
 from shapely.wkb import dumps as wkb_dumps
 
 from ki_geodaten.app.main import create_app
+from ki_geodaten.config import Settings
 from ki_geodaten.jobs.store import get_job, insert_polygons, update_status
 from ki_geodaten.models import JobStatus
 
@@ -47,7 +49,8 @@ def test_post_jobs_persists_run_metadata_snapshot(client):
     assert metadata["tile_preset"] == "medium"
     assert "settings" in metadata
     assert metadata["settings"]["SAM3_MODEL_ID"] == app.state.settings.SAM3_MODEL_ID
-    assert metadata["settings"]["WMS_LAYER"] == app.state.settings.WMS_LAYER
+    assert metadata["settings"]["WCS_COVERAGE_ID"] == app.state.settings.WCS_COVERAGE_ID
+    assert metadata["settings"]["WCS_URL"] == app.state.settings.WCS_URL
     assert "git_commit_sha" in metadata
     assert "package_version" in metadata
 
@@ -80,6 +83,52 @@ def test_post_jobs_rejects_token_count_over_limit(client):
     assert response.status_code == 422
 
 
+def test_post_jobs_rejects_ndsm_filter_when_dom_dgm_disabled(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = create_app(
+        settings=Settings(MODALITY_USE_NDSM=False),
+        executor_factory=lambda: ThreadPoolExecutor(max_workers=2),
+        token_counter=lambda value: len(value.split()),
+    )
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/jobs",
+            json={
+                "prompt": "building",
+                "bbox_wgs84": _munich_bbox(),
+                "modality_filter": {"ndsm_min": 2.0},
+            },
+        )
+
+    assert response.status_code == 422
+    assert "MODALITY_USE_NDSM" in response.text
+
+
+def test_post_jobs_accepts_ndsm_filter_when_dom_and_dgm_are_configured(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    settings = Settings(
+        MODALITY_USE_NDSM=True,
+        DGM_METALINK_URL="http://example/metalink/dgm1",
+        DOM_METALINK_URL="http://example/metalink/dom20dom",
+    )
+    app = create_app(
+        settings=settings,
+        executor_factory=lambda: ThreadPoolExecutor(max_workers=2),
+        token_counter=lambda value: len(value.split()),
+    )
+    with TestClient(app) as test_client:
+        response = test_client.post(
+            "/jobs",
+            json={
+                "prompt": "building",
+                "bbox_wgs84": _munich_bbox(),
+                "modality_filter": {"ndsm_min": 2.0},
+            },
+        )
+
+    assert response.status_code == 200
+
+
 def _make_reviewable_job(test_client, app, n_polys=2, status=JobStatus.READY_FOR_REVIEW):
     job_id = test_client.post(
         "/jobs",
@@ -108,11 +157,35 @@ def test_list_and_get_job_return_revision_fields(client):
     listed = test_client.get("/jobs").json()
     entry = next(item for item in listed if item["id"] == job_id)
     assert entry["bbox_wgs84"] == _munich_bbox()
+    assert entry["label"] is None
     assert entry["validation_revision"] == 0
     assert entry["exported_revision"] is None
     assert entry["export_stale"] is True
     detail = test_client.get(f"/jobs/{job_id}").json()
     assert detail["id"] == job_id
+    assert detail["label"] is None
+
+
+def test_patch_job_label_updates_list_detail_and_summary(client):
+    test_client, app = client
+    job_id = _make_reviewable_job(test_client, app)
+
+    updated = test_client.patch(
+        f"/jobs/{job_id}/label",
+        json={"label": "  SAM only  "},
+    )
+
+    assert updated.status_code == 200
+    assert updated.json()["label"] == "SAM only"
+    listed = test_client.get("/jobs").json()
+    entry = next(item for item in listed if item["id"] == job_id)
+    assert entry["label"] == "SAM only"
+    assert test_client.get(f"/jobs/{job_id}").json()["label"] == "SAM only"
+    assert test_client.get(f"/jobs/{job_id}/summary").json()["label"] == "SAM only"
+
+    cleared = test_client.patch(f"/jobs/{job_id}/label", json={"label": "   "})
+    assert cleared.status_code == 200
+    assert cleared.json()["label"] is None
 
 
 def test_job_summary_and_missed_estimate_endpoints(client):
@@ -139,6 +212,44 @@ def test_job_summary_and_missed_estimate_endpoints(client):
     assert summary.json()["missed_estimate"] == 1
     assert summary.json()["precision_review"] == pytest.approx(2 / 3)
     assert summary.json()["recall_estimate"] == pytest.approx(2 / 3)
+
+
+def test_missed_object_annotations_update_summary_and_geojson(client):
+    test_client, app = client
+    job_id = _make_reviewable_job(test_client, app, n_polys=3)
+
+    created = test_client.post(
+        f"/jobs/{job_id}/missed_objects",
+        json={"lon": 11.555, "lat": 48.135},
+    )
+    assert created.status_code == 200
+    missed_id = created.json()["id"]
+
+    summary = test_client.get(f"/jobs/{job_id}/summary").json()
+    assert summary["missed_marked"] == 1
+    assert summary["missed_for_recall"] == 1
+    assert summary["missed_source"] == "marked"
+    assert summary["recall_estimate"] == pytest.approx(3 / 4)
+
+    geojson = test_client.get(f"/jobs/{job_id}/missed_objects")
+    assert geojson.status_code == 200
+    assert geojson.json()["features"][0]["properties"]["id"] == missed_id
+
+    deleted = test_client.delete(f"/jobs/{job_id}/missed_objects/{missed_id}")
+    assert deleted.status_code == 200
+    assert test_client.get(f"/jobs/{job_id}/summary").json()["missed_marked"] == 0
+
+
+def test_missed_object_rejects_outside_job_bbox(client):
+    test_client, app = client
+    job_id = _make_reviewable_job(test_client, app)
+
+    response = test_client.post(
+        f"/jobs/{job_id}/missed_objects",
+        json={"lon": 13.0, "lat": 50.0},
+    )
+
+    assert response.status_code == 422
 
 
 def test_missed_estimate_rejects_negative_values(client):
@@ -204,3 +315,21 @@ def test_geojson_routes_return_json_for_reviewable_job(client):
     nodata = test_client.get(f"/jobs/{job_id}/nodata")
     assert nodata.status_code == 200
     assert nodata.json()["features"] == []
+    missed = test_client.get(f"/jobs/{job_id}/missed_objects")
+    assert missed.status_code == 200
+    assert missed.json()["features"] == []
+
+
+def test_export_includes_missed_objects_layer(client):
+    test_client, app = client
+    job_id = _make_reviewable_job(test_client, app)
+    test_client.post(
+        f"/jobs/{job_id}/missed_objects",
+        json={"lon": 11.555, "lat": 48.135},
+    )
+
+    response = test_client.post(f"/jobs/{job_id}/export")
+
+    assert response.status_code == 200
+    layers = fiona.listlayers(response.json()["gpkg_path"])
+    assert "missed_objects" in layers

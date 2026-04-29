@@ -1,4 +1,10 @@
-# LDBV DOP20 WMS Verification
+# LDBV DOP20 WMS Verification (UI Basemap Only)
+
+> **Scope:** This document verified the LDBV DOP20 WMS for use as a **Leaflet
+> basemap** in the review UI. The pipeline data path was migrated to WCS
+> on 2026-04-28; see [`wcs-verification.md`](wcs-verification.md) for the
+> pipeline-relevant verification. The WMS is no longer used for any model
+> input — it only serves rendered tiles to the browser.
 
 Verified on: 2026-04-25
 

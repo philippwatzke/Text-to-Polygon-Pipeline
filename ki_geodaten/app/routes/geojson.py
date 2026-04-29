@@ -6,8 +6,17 @@ from functools import partial
 
 from fastapi import APIRouter, HTTPException, Request, Response
 
-from ki_geodaten.app.serialization import build_nodata_geojson, build_polygons_geojson
-from ki_geodaten.jobs.store import get_job, get_nodata_for_job, get_polygons_for_job
+from ki_geodaten.app.serialization import (
+    build_missed_objects_geojson,
+    build_nodata_geojson,
+    build_polygons_geojson,
+)
+from ki_geodaten.jobs.store import (
+    get_job,
+    get_missed_objects_for_job,
+    get_nodata_for_job,
+    get_polygons_for_job,
+)
 
 router = APIRouter()
 
@@ -19,7 +28,7 @@ async def _build_geojson(request: Request, job_id: str, target: str) -> Response
     if job["status"] not in {"READY_FOR_REVIEW", "EXPORTED"}:
         raise HTTPException(409, "job not ready")
 
-    revision = job["validation_revision"] if target == "polygons" else 0
+    revision = job["validation_revision"] if target in {"polygons", "missed_objects"} else 0
     cache_key = (job_id, revision, target)
     cached = request.app.state.geojson_cache.get(cache_key)
     if cached is not None:
@@ -29,6 +38,9 @@ async def _build_geojson(request: Request, job_id: str, target: str) -> Response
     if target == "polygons":
         rows = get_polygons_for_job(request.app.state.db_path, job_id)
         fn = partial(build_polygons_geojson, rows, aoi_utm=aoi_utm)
+    elif target == "missed_objects":
+        rows = get_missed_objects_for_job(request.app.state.db_path, job_id)
+        fn = partial(build_missed_objects_geojson, rows, aoi_utm=aoi_utm)
     else:
         rows = get_nodata_for_job(request.app.state.db_path, job_id)
         fn = partial(build_nodata_geojson, rows, aoi_utm=aoi_utm)
@@ -47,3 +59,8 @@ async def polygons_geojson(job_id: str, request: Request):
 @router.get("/jobs/{job_id}/nodata")
 async def nodata_geojson(job_id: str, request: Request):
     return await _build_geojson(request, job_id, "nodata")
+
+
+@router.get("/jobs/{job_id}/missed_objects")
+async def missed_objects_geojson(job_id: str, request: Request):
+    return await _build_geojson(request, job_id, "missed_objects")

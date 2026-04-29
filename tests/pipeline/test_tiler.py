@@ -111,6 +111,19 @@ def test_iter_grid_edge_shifts_last_tile_inward():
     assert last_tile[3] + 1024 == 1500
 
 
+def test_iter_tiles_edge_shift_ownership_bounds_do_not_overlap():
+    path = _fresh_path("edge_shift_ownership.tif")
+    _make_rgb_tif(path, 1500, 1024, (0, 0, 300.0, 204.8), set_nodata=False)
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+
+    tiles = list(iter_tiles(path, cfg))
+    bounds = [tile.ownership_bounds_pixel for tile in tiles if not isinstance(tile, NodataTile)]
+
+    assert bounds[0] == (320.0, 704.0, 320.0, 704.0)
+    assert bounds[1] == (320.0, 704.0, 704.0, 796.0)
+    assert bounds[2] == (320.0, 704.0, 796.0, 1180.0)
+
+
 def test_iter_grid_unique_logical_indices():
     grid = list(iter_grid(FakeSrc(1500, 1500), TileConfig.from_preset(TilePreset.MEDIUM)))
     indices = [(row, col) for row, col, _, _ in grid]
@@ -218,6 +231,63 @@ def test_iter_tiles_alpha_mask_marks_nodata():
     tiles = list(iter_tiles(path, cfg))
 
     assert isinstance(tiles[0], NodataTile)
+
+
+def test_iter_tiles_read_nir_populates_band4():
+    path = _fresh_path("four_band_nir.tif")
+    _make_rgb_tif(path, 1024, 1024, (0, 0, 204.8, 204.8), bands=4, set_nodata=False)
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+
+    tiles = list(iter_tiles(path, cfg, read_nir=True))
+
+    tile = tiles[0]
+    assert not isinstance(tile, NodataTile)
+    assert tile.nir is not None
+    assert tile.nir.shape == (1024, 1024)
+    assert tile.nir.dtype == np.uint8
+
+
+def test_iter_tiles_read_nir_off_returns_none():
+    path = _fresh_path("four_band_nir_off.tif")
+    _make_rgb_tif(path, 1024, 1024, (0, 0, 204.8, 204.8), bands=4, set_nodata=False)
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+
+    tiles = list(iter_tiles(path, cfg))
+
+    assert tiles[0].nir is None
+
+
+def test_iter_tiles_resamples_ndsm_onto_dop_grid():
+    rgb_path = _fresh_path("rgb_for_ndsm.tif")
+    _make_rgb_tif(rgb_path, 1024, 1024, (0, 0, 204.8, 204.8), bands=4, set_nodata=False)
+
+    ndsm_path = _fresh_path("ndsm_native.tif")
+    # Native nDSM grid: 1 m step, covers AOI plus a margin, single float band.
+    width = 220
+    height = 220
+    profile = dict(
+        driver="GTiff",
+        width=width,
+        height=height,
+        count=1,
+        dtype="float32",
+        crs="EPSG:25832",
+        transform=from_bounds(-10.0, -10.0, 210.0, 210.0, width, height),
+    )
+    arr = np.zeros((height, width), dtype=np.float32)
+    arr[100:110, 100:110] = 8.0  # tall structure roughly in the centre
+    with rasterio.open(ndsm_path, "w", **profile) as dst:
+        dst.write(arr, 1)
+
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+    tiles = list(iter_tiles(rgb_path, cfg, ndsm_path=ndsm_path))
+
+    tile = tiles[0]
+    assert tile.ndsm is not None
+    assert tile.ndsm.shape == (1024, 1024)
+    assert tile.ndsm.dtype == np.float32
+    # Tall pixels are roughly at the centre of the tile after resampling.
+    assert tile.ndsm.max() > 5.0
 
 
 def test_safe_center_polygon_medium():
