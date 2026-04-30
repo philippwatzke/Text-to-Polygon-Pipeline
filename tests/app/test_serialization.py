@@ -62,6 +62,27 @@ def test_polygons_clip_by_aoi_and_drop_fully_outside():
     assert [f["properties"]["id"] for f in fc["features"]] == [1]
 
 
+def test_polygons_can_clip_to_viewport_bbox():
+    left = Polygon(
+        [(691100, 5335100), (691105, 5335100), (691105, 5335105), (691100, 5335105)]
+    )
+    right = Polygon(
+        [(691500, 5335100), (691505, 5335100), (691505, 5335105), (691500, 5335105)]
+    )
+    rows = [
+        {"id": 1, "geometry_wkb": _poly_wkb(left), "score": 0.8, "validation": "ACCEPTED"},
+        {"id": 2, "geometry_wkb": _poly_wkb(right), "score": 0.8, "validation": "ACCEPTED"},
+    ]
+
+    fc = build_polygons_feature_collection(
+        rows,
+        aoi_utm=_aoi_utm(),
+        clip_utm=(691050, 5335050, 691150, 5335150),
+    )
+
+    assert [f["properties"]["id"] for f in fc["features"]] == [1]
+
+
 def test_nodata_geojson_carries_reason():
     poly = Polygon(
         [(691100, 5335100), (691200, 5335100), (691200, 5335200), (691100, 5335200)]

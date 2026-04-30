@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     WCS_FORMAT: str = "image/tiff"
     WCS_CRS: str = "EPSG:25832"
     WCS_MAX_PIXELS: int = 6000
+    DOP_DOWNLOAD_WORKERS: int = 4
     WCS_USERNAME: str = ""
     WCS_PASSWORD: str = ""
     # DOP20 raster grid origin per LDBV DescribeCoverage (gml:origin =

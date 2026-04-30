@@ -20,6 +20,7 @@ LDBV WCS at native 0.2 m resolution.
 from __future__ import annotations
 
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from dataclasses import dataclass
 from pathlib import Path
@@ -629,6 +630,7 @@ def download_dop20(
     wms_version: str = "1.1.1",
     wms_format: str = "image/png",
     source: str = "wcs",
+    download_workers: int = 4,
 ) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     chunks = plan_chunk_grid(
@@ -638,27 +640,42 @@ def download_dop20(
         origin_x=origin_x,
         origin_y=origin_y,
     )
-    session = _build_session(username=username, password=password)
-    chunk_files: list[Path] = []
-    for chunk in chunks:
+    def fetch_one(index: int, chunk: ChunkPlan) -> tuple[int, Path]:
         path = out_dir / f"chunk_{chunk.row}_{chunk.col}.tif"
-        _fetch_chunk(
-            session,
-            wcs_url,
-            coverage_id,
-            chunk,
-            path,
-            wcs_version=wcs_version,
-            fmt=fmt,
-            crs=crs,
-            fill_rgb_zero_with_wms=fill_rgb_zero_with_wms,
-            wms_url=wms_url,
-            wms_layer=wms_layer,
-            wms_version=wms_version,
-            wms_format=wms_format,
-            source=source,
-        )
-        chunk_files.append(path)
+        with _build_session(username=username, password=password) as session:
+            _fetch_chunk(
+                session,
+                wcs_url,
+                coverage_id,
+                chunk,
+                path,
+                wcs_version=wcs_version,
+                fmt=fmt,
+                crs=crs,
+                fill_rgb_zero_with_wms=fill_rgb_zero_with_wms,
+                wms_url=wms_url,
+                wms_layer=wms_layer,
+                wms_version=wms_version,
+                wms_format=wms_format,
+                source=source,
+            )
+        return index, path
+
+    worker_count = max(1, min(int(download_workers), len(chunks)))
+    chunk_files: list[Path] = [Path()] * len(chunks)
+    if worker_count == 1:
+        for index, chunk in enumerate(chunks):
+            _, path = fetch_one(index, chunk)
+            chunk_files[index] = path
+    else:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(fetch_one, index, chunk): index
+                for index, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                index, path = future.result()
+                chunk_files[index] = path
 
     vrt_path = out_dir / "out.vrt"
     _build_vrt(vrt_path, chunk_files, crs=crs)

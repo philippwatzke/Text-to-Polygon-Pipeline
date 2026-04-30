@@ -320,6 +320,25 @@ def test_geojson_routes_return_json_for_reviewable_job(client):
     assert missed.json()["features"] == []
 
 
+def test_geojson_routes_accept_viewport_bbox(client):
+    test_client, app = client
+    job_id = _make_reviewable_job(test_client, app)
+
+    response = test_client.get(f"/jobs/{job_id}/polygons?bbox=0,0,1,1")
+
+    assert response.status_code == 200
+    assert response.json()["features"] == []
+
+
+def test_geojson_routes_reject_invalid_viewport_bbox(client):
+    test_client, app = client
+    job_id = _make_reviewable_job(test_client, app)
+
+    response = test_client.get(f"/jobs/{job_id}/polygons?bbox=11.0,48.0,10.0,49.0")
+
+    assert response.status_code == 422
+
+
 def test_export_includes_missed_objects_layer(client):
     test_client, app = client
     job_id = _make_reviewable_job(test_client, app)

@@ -1,5 +1,6 @@
 import io
 import shutil
+import time
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -22,6 +23,7 @@ from ki_geodaten.pipeline.dop_client import (
     plan_chunk_grid,
     prepare_download_bbox,
 )
+import ki_geodaten.pipeline.dop_client as dop_client
 
 
 def test_prepare_expands_by_center_margin_medium():
@@ -477,6 +479,41 @@ def test_download_dop20_builds_vrt_without_osgeo(tmp_path, monkeypatch):
             assert src.height == 1024
     finally:
         sys.meta_path.remove(blocker)
+
+
+def test_download_dop20_parallel_fetch_keeps_vrt_chunk_order(tmp_path, monkeypatch):
+    calls = []
+    built = {}
+
+    def fake_fetch_chunk(session, wcs_url, coverage_id, chunk, out_path, **kwargs):
+        time.sleep(0.02 if chunk.col == 0 else 0.0)
+        out_path.write_bytes(b"chunk")
+        calls.append((chunk.row, chunk.col))
+
+    def fake_build_vrt(vrt_path, chunk_files, *, crs, step=0.2):
+        built["files"] = [path.name for path in chunk_files]
+        vrt_path.write_text("vrt", encoding="utf-8")
+
+    monkeypatch.setattr(dop_client, "_fetch_chunk", fake_fetch_chunk)
+    monkeypatch.setattr(dop_client, "_build_vrt", fake_build_vrt)
+
+    vrt_path = download_dop20(
+        bbox_utm=(0.0, 0.0, 409.6, 204.8),
+        out_dir=tmp_path,
+        wcs_url="http://example/wcs",
+        coverage_id="by_dop20c",
+        wcs_version="2.0.1",
+        fmt="image/tiff",
+        crs="EPSG:25832",
+        max_pixels=1024,
+        origin_x=0.0,
+        origin_y=0.0,
+        download_workers=2,
+    )
+
+    assert vrt_path == tmp_path / "out.vrt"
+    assert sorted(calls) == [(0, 0), (0, 1)]
+    assert built["files"] == ["chunk_0_0.tif", "chunk_0_1.tif"]
 
 
 def test_build_vrt_mosaics_adjacent_chunks(tmp_path):

@@ -9,6 +9,7 @@ import rasterio
 from affine import Affine
 from rasterio.enums import Resampling
 from rasterio.vrt import WarpedVRT
+from rasterio.warp import reproject
 from rasterio.windows import Window, from_bounds as window_from_bounds
 from shapely.geometry import Polygon
 
@@ -138,6 +139,55 @@ def _read_ndsm_for_tile(
     return ndsm.astype(np.float32, copy=False)
 
 
+def _same_grid(src, other) -> bool:
+    return (
+        src.width == other.width
+        and src.height == other.height
+        and src.crs == other.crs
+        and tuple(round(value, 9) for value in src.transform) == tuple(
+            round(value, 9) for value in other.transform
+        )
+    )
+
+
+def align_raster_to_reference_grid(
+    source_path: Path,
+    reference_path: Path,
+    out_path: Path,
+) -> Path:
+    """Inputs: Path, Path, Path. Logic: resample a single-band raster onto a reference raster grid. Returns: Path."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with rasterio.open(source_path) as src, rasterio.open(reference_path) as ref:
+        profile = {
+            "driver": "GTiff",
+            "width": ref.width,
+            "height": ref.height,
+            "count": 1,
+            "dtype": "float32",
+            "crs": ref.crs,
+            "transform": ref.transform,
+            "nodata": np.nan,
+            "compress": "deflate",
+            "predictor": 3,
+            "tiled": True,
+            "blockxsize": 512,
+            "blockysize": 512,
+        }
+        with rasterio.open(out_path, "w", **profile) as dst:
+            reproject(
+                source=rasterio.band(src, 1),
+                destination=rasterio.band(dst, 1),
+                src_transform=src.transform,
+                src_crs=src.crs or ref.crs,
+                src_nodata=src.nodata,
+                dst_transform=ref.transform,
+                dst_crs=ref.crs,
+                dst_nodata=np.nan,
+                resampling=Resampling.bilinear,
+            )
+    return out_path
+
+
 def iter_tiles(
     vrt_path: Path,
     cfg: TileConfig,
@@ -158,6 +208,7 @@ def iter_tiles(
         ndsm_src = rasterio.open(ndsm_path) if ndsm_path is not None else None
         try:
             with rasterio.open(vrt_path) as src:
+                ndsm_is_on_dop_grid = ndsm_src is not None and _same_grid(ndsm_src, src)
                 col_offsets = _axis_offsets(src.width, cfg.size, cfg.tile_step)
                 row_offsets = _axis_offsets(src.height, cfg.size, cfg.tile_step)
                 col_ownership = _ownership_intervals(col_offsets, cfg.size, cfg.center_margin)
@@ -210,7 +261,15 @@ def iter_tiles(
 
                         ndsm_band: np.ndarray | None = None
                         if ndsm_src is not None:
-                            ndsm_band = _read_ndsm_for_tile(ndsm_src, tile_affine, cfg.size)
+                            if ndsm_is_on_dop_grid:
+                                ndsm_band = ndsm_src.read(
+                                    1,
+                                    window=window,
+                                    boundless=True,
+                                    fill_value=np.nan,
+                                ).astype(np.float32, copy=False)
+                            else:
+                                ndsm_band = _read_ndsm_for_tile(ndsm_src, tile_affine, cfg.size)
 
                         yield Tile(
                             array=rgb,

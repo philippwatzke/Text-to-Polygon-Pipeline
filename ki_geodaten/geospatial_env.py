@@ -27,6 +27,26 @@ def _bundled_pyproj_data_dir() -> Path | None:
     return None
 
 
+def _conda_share_dir(name: str, sentinel: str) -> Path | None:
+    roots = [os.environ.get("CONDA_PREFIX"), sys.prefix]
+    seen: set[Path] = set()
+    for raw_root in roots:
+        if not raw_root:
+            continue
+        root = Path(raw_root)
+        if root in seen:
+            continue
+        seen.add(root)
+        candidates = (
+            root / "Library" / "share" / name,
+            root / "share" / name,
+        )
+        for candidate in candidates:
+            if (candidate / sentinel).is_file():
+                return candidate
+    return None
+
+
 def _bundled_rasterio_gdal_data_dir() -> Path | None:
     package_dir = _package_dir("rasterio")
     if package_dir is None:
@@ -61,7 +81,7 @@ def configure_geospatial_runtime() -> dict[str, str]:
 
     configured: dict[str, str] = {}
 
-    proj_dir = _bundled_pyproj_data_dir()
+    proj_dir = _bundled_pyproj_data_dir() or _conda_share_dir("proj", "proj.db")
     if proj_dir is not None:
         proj_value = str(proj_dir)
         os.environ["PROJ_DATA"] = proj_value
@@ -76,7 +96,7 @@ def configure_geospatial_runtime() -> dict[str, str]:
 
             pyproj.datadir.set_data_dir(proj_value)
 
-    gdal_dir = _bundled_rasterio_gdal_data_dir()
+    gdal_dir = _bundled_rasterio_gdal_data_dir() or _conda_share_dir("gdal", "gdalvrt.xsd")
     if gdal_dir is not None:
         gdal_value = str(gdal_dir)
         os.environ["GDAL_DATA"] = gdal_value

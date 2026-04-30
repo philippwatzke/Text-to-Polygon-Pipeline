@@ -1,0 +1,21 @@
+name: sam_geo_pipeline
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - nodefaults
+dependencies:
+  - python=3.12
+  - pip>=24
+  - numpy>=1.26,<2
+  - gdal
+  - rasterio>=1.4,<1.5
+  - fiona
+  - geopandas>=1.0
+  - shapely>=2.0
+  - pyproj>=3.6
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu128
+      - torch==2.10.0+cu128
+      - torchvision==0.25.0+cu128
+      - -e .[dev]

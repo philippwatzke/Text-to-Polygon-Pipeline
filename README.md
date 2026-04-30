@@ -27,36 +27,46 @@ You need:
 
 ## Install
 
+This project is intentionally installed through Conda/Mamba, not `venv`, so GDAL,
+Fiona, Rasterio, PyTorch, and CUDA are solved as one reproducible environment.
 From the repository root:
 
 ```powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -e .[dev]
+mamba env create -f environment.yml
+conda activate sam_geo_pipeline
 ```
 
-Install CUDA PyTorch for your CUDA runtime. Example for CUDA 12.8:
+If `mamba` is not available, use Conda with the same lock point:
 
 ```powershell
-python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+conda env create -f environment.yml
+conda activate sam_geo_pipeline
 ```
 
-Install or refresh the SAM/Transformers dependencies if needed:
+Update an existing environment after dependency changes:
 
 ```powershell
-python -m pip install transformers accelerate
+mamba env update -f environment.yml --prune
+conda activate sam_geo_pipeline
+```
+
+Verify the environment:
+
+```powershell
+python -m pip check
+python -c "import rasterio, fiona, geopandas, torch; print(torch.__version__, torch.version.cuda)"
+```
+
+Authenticate Hugging Face after activation:
+
+```powershell
 huggingface-cli login
 ```
 
-On systems where Fiona/GDAL wheels are unavailable, install geospatial packages
-through conda-forge first, then run `pip install -e .[dev]`:
-
-```powershell
-conda create -n ki-geodaten python=3.12 fiona rasterio geopandas -c conda-forge
-conda activate ki-geodaten
-python -m pip install -e .[dev]
-```
+`environment.yml` keeps the geospatial stack in Conda and pins CUDA PyTorch as
+`torch==2.10.0+cu128` / `torchvision==0.25.0+cu128` inside that Conda
+environment. This avoids the Windows Conda solver selecting CPU-only PyTorch
+builds while still avoiding a standalone `venv`.
 
 ## Configure
 
@@ -83,6 +93,7 @@ Important runtime defaults:
 ```text
 DOP_SOURCE=wcs
 WCS_COVERAGE_ID=OI.OrthoimageCoverage
+DOP_DOWNLOAD_WORKERS=4
 MODALITY_USE_NDVI=true
 MODALITY_USE_NDSM=false
 GLOBAL_POLYGON_NMS_IOU=0.5
@@ -96,14 +107,16 @@ Run server and worker in two separate terminals from the repository root.
 Terminal 1, review UI and API:
 
 ```powershell
-.\.venv\Scripts\python.exe -m uvicorn ki_geodaten.app.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir ki_geodaten --reload-exclude "data/*" --reload-exclude "*.db*"
+conda activate sam_geo_pipeline
+python -m uvicorn ki_geodaten.app.main:app --host 127.0.0.1 --port 8000 --reload --reload-dir ki_geodaten --reload-exclude "data/*" --reload-exclude "*.db*"
 ```
 
 Terminal 2, GPU worker:
 
 ```powershell
+conda activate sam_geo_pipeline
 $env:PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
-.\.venv\Scripts\python.exe -m ki_geodaten.worker.loop
+python -m ki_geodaten.worker.loop
 ```
 
 Open:
@@ -134,7 +147,8 @@ worker claims them.
 Run the reproducible test suite:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest tests -q -p no:cacheprovider
+conda activate sam_geo_pipeline
+python -m pytest tests -q -p no:cacheprovider
 ```
 
 Run the gated SAM smoke test only after Hugging Face authentication and model
@@ -143,14 +157,17 @@ access are configured:
 ```powershell
 $env:RUN_SAM3_SMOKE="1"
 $env:SAM3_MODEL_ID="facebook/sam3"
-.\.venv\Scripts\python.exe -m pytest tests\pipeline\test_sam3_adapter_smoke.py -q -p no:cacheprovider
+python -m pytest tests\pipeline\test_sam3_adapter_smoke.py -q -p no:cacheprovider
 ```
 
 ## Reproducibility Notes
 
 - Runtime configuration is read from `.env` through `ki_geodaten.config.Settings`.
+- The runtime environment is declared in `environment.yml` as `sam_geo_pipeline`.
 - WCS is the model input path; WMS is only the Leaflet review basemap.
 - Job metadata stores the effective run configuration for later inspection.
+- DOP WCS chunks are downloaded in parallel with deterministic VRT ordering.
+- nDSM is aligned once to the DOP grid per job and then read by tile window.
 - Global polygon NMS is deterministic: candidates are sorted by score, area,
   tile position, and original position before suppression.
 - `data/` is intentionally ignored by Git because it contains local rasters,

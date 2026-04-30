@@ -34,6 +34,7 @@ from ki_geodaten.pipeline.segmenter import SegmenterUnavailableError
 from ki_geodaten.pipeline.tiler import (
     NodataTile,
     TileConfig,
+    align_raster_to_reference_grid,
     iter_grid,
     iter_tiles,
     safe_center_polygon,
@@ -208,6 +209,7 @@ def run_job(
     origin_y: float,
     min_polygon_area_m2: float,
     safe_center_nodata_threshold: float,
+    dop_download_workers: int = 4,
     wcs_username: str = "",
     wcs_password: str = "",
     fill_wcs_rgb_zero_with_wms: bool = False,
@@ -255,6 +257,7 @@ def run_job(
             fmt=fmt,
             crs=crs,
             max_pixels=max_pixels,
+            download_workers=dop_download_workers,
             origin_x=origin_x,
             origin_y=origin_y,
             username=wcs_username,
@@ -302,6 +305,11 @@ def run_job(
                     dom_path=dom_result.path,
                     dgm_path=dgm_result.path,
                     out_path=ndsm_path,
+                )
+                ndsm_path = align_raster_to_reference_grid(
+                    ndsm_path,
+                    vrt_path,
+                    out_dir / "ndsm_aligned_to_dop.tif",
                 )
             except DemDownloadError:
                 logger.exception(

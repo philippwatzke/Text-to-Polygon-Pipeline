@@ -25,7 +25,8 @@ Recommended first grid for buildings:
 Example baseline job:
 
 ```powershell
-.\.venv\Scripts\python.exe scripts\run_heuristic_baseline.py `
+conda activate sam_geo_pipeline
+python scripts\run_heuristic_baseline.py `
   --prompt building `
   --label heuristic_building_ndsm3 `
   --bbox-wgs84 11.55 48.13 11.56 48.14 `

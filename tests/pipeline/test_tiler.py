@@ -13,6 +13,7 @@ from ki_geodaten.pipeline.tiler import (
     NodataTile,
     Tile,
     TileConfig,
+    align_raster_to_reference_grid,
     iter_grid,
     iter_tiles,
     safe_center_polygon,
@@ -287,6 +288,40 @@ def test_iter_tiles_resamples_ndsm_onto_dop_grid():
     assert tile.ndsm.shape == (1024, 1024)
     assert tile.ndsm.dtype == np.float32
     # Tall pixels are roughly at the centre of the tile after resampling.
+    assert tile.ndsm.max() > 5.0
+
+
+def test_align_raster_to_reference_grid_enables_direct_ndsm_window_reads():
+    rgb_path = _fresh_path("rgb_for_aligned_ndsm.tif")
+    _make_rgb_tif(rgb_path, 1024, 1024, (0, 0, 204.8, 204.8), bands=4, set_nodata=False)
+
+    source_path = _fresh_path("ndsm_source_for_align.tif")
+    source_profile = dict(
+        driver="GTiff",
+        width=220,
+        height=220,
+        count=1,
+        dtype="float32",
+        crs="EPSG:25832",
+        transform=from_bounds(-10.0, -10.0, 210.0, 210.0, 220, 220),
+    )
+    arr = np.zeros((220, 220), dtype=np.float32)
+    arr[100:110, 100:110] = 8.0
+    with rasterio.open(source_path, "w", **source_profile) as dst:
+        dst.write(arr, 1)
+
+    aligned_path = _fresh_path("ndsm_aligned_to_dop.tif")
+    align_raster_to_reference_grid(source_path, rgb_path, aligned_path)
+
+    with rasterio.open(rgb_path) as ref, rasterio.open(aligned_path) as aligned:
+        assert aligned.width == ref.width
+        assert aligned.height == ref.height
+        assert aligned.transform == ref.transform
+
+    cfg = TileConfig.from_preset(TilePreset.MEDIUM)
+    tile = list(iter_tiles(rgb_path, cfg, ndsm_path=aligned_path))[0]
+    assert tile.ndsm is not None
+    assert tile.ndsm.shape == (1024, 1024)
     assert tile.ndsm.max() > 5.0
 
 

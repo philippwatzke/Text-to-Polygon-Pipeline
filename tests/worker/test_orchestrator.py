@@ -206,6 +206,10 @@ def test_orchestrator_derives_ndsm_from_dom_and_dgm_when_requested(tmp_path, mon
         captured["derive"] = (dom_path.name, dgm_path.name, out_path.name)
         out_path.write_bytes(b"ndsm")
 
+    def fake_align(source_path, reference_path, out_path):
+        captured["align"] = (source_path.name, reference_path.name, out_path.name)
+        return out_path
+
     def fake_iter_tiles(vrt_path, cfg, **kwargs):
         captured["ndsm_path"] = kwargs.get("ndsm_path")
         return iter([_tile()])
@@ -217,6 +221,7 @@ def test_orchestrator_derives_ndsm_from_dom_and_dgm_when_requested(tmp_path, mon
     monkeypatch.setattr("ki_geodaten.worker.orchestrator.rasterio.open", lambda *args, **kwargs: FakeSrc())
     monkeypatch.setattr("ki_geodaten.worker.orchestrator.fetch_tiles_via_metalink", fake_fetch_tiles_via_metalink)
     monkeypatch.setattr("ki_geodaten.worker.orchestrator.derive_ndsm_from_dom_dgm", fake_derive)
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.align_raster_to_reference_grid", fake_align)
     monkeypatch.setattr("ki_geodaten.worker.orchestrator.iter_tiles", fake_iter_tiles)
 
     run_job(
@@ -245,7 +250,8 @@ def test_orchestrator_derives_ndsm_from_dom_and_dgm_when_requested(tmp_path, mon
         ("dgm.vrt", "http://example/metalink/dgm1", tmp_path / "dgm-cache"),
     ]
     assert captured["derive"] == ("dom.vrt", "dgm.vrt", "ndsm.tif")
-    assert captured["ndsm_path"].name == "ndsm.tif"
+    assert captured["align"] == ("ndsm.tif", "fake.vrt", "ndsm_aligned_to_dop.tif")
+    assert captured["ndsm_path"].name == "ndsm_aligned_to_dop.tif"
 
 
 def test_orchestrator_happy_path_marks_ready(tmp_path, monkeypatch):

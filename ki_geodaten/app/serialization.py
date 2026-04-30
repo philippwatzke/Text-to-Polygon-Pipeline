@@ -42,12 +42,16 @@ def build_polygons_feature_collection(
     rows: Iterable[dict],
     *,
     aoi_utm: tuple[float, float, float, float],
+    clip_utm: tuple[float, float, float, float] | None = None,
 ) -> dict:
     aoi = box(*aoi_utm)
+    clip = aoi if clip_utm is None else aoi.intersection(box(*clip_utm))
     features: list[dict] = []
     for row in rows:
         geom = wkb_loads(row["geometry_wkb"])
-        for transformed in _clip_transform_precision(geom, aoi):
+        if clip.is_empty or not geom.intersects(clip):
+            continue
+        for transformed in _clip_transform_precision(geom, clip):
             features.append(
                 {
                     "type": "Feature",
@@ -66,20 +70,27 @@ def build_polygons_geojson(
     rows: Iterable[dict],
     *,
     aoi_utm: tuple[float, float, float, float],
+    clip_utm: tuple[float, float, float, float] | None = None,
 ) -> str:
-    return json.dumps(build_polygons_feature_collection(rows, aoi_utm=aoi_utm))
+    return json.dumps(
+        build_polygons_feature_collection(rows, aoi_utm=aoi_utm, clip_utm=clip_utm)
+    )
 
 
 def build_nodata_feature_collection(
     rows: Iterable[dict],
     *,
     aoi_utm: tuple[float, float, float, float],
+    clip_utm: tuple[float, float, float, float] | None = None,
 ) -> dict:
     aoi = box(*aoi_utm)
+    clip = aoi if clip_utm is None else aoi.intersection(box(*clip_utm))
     features: list[dict] = []
     for row in rows:
         geom = wkb_loads(row["geometry_wkb"])
-        for transformed in _clip_transform_precision(geom, aoi):
+        if clip.is_empty or not geom.intersects(clip):
+            continue
+        for transformed in _clip_transform_precision(geom, clip):
             features.append(
                 {
                     "type": "Feature",
@@ -94,8 +105,9 @@ def build_nodata_geojson(
     rows: Iterable[dict],
     *,
     aoi_utm: tuple[float, float, float, float],
+    clip_utm: tuple[float, float, float, float] | None = None,
 ) -> str:
-    return json.dumps(build_nodata_feature_collection(rows, aoi_utm=aoi_utm))
+    return json.dumps(build_nodata_feature_collection(rows, aoi_utm=aoi_utm, clip_utm=clip_utm))
 
 
 def _transform_point_precision(geom, aoi_utm_polygon):
@@ -109,12 +121,14 @@ def build_missed_objects_feature_collection(
     rows: Iterable[dict],
     *,
     aoi_utm: tuple[float, float, float, float],
+    clip_utm: tuple[float, float, float, float] | None = None,
 ) -> dict:
     aoi = box(*aoi_utm)
+    clip = aoi if clip_utm is None else aoi.intersection(box(*clip_utm))
     features: list[dict] = []
     for row in rows:
         geom = wkb_loads(row["geometry_wkb"])
-        transformed = _transform_point_precision(geom, aoi)
+        transformed = _transform_point_precision(geom, clip)
         if transformed is None:
             continue
         features.append(
@@ -134,5 +148,8 @@ def build_missed_objects_geojson(
     rows: Iterable[dict],
     *,
     aoi_utm: tuple[float, float, float, float],
+    clip_utm: tuple[float, float, float, float] | None = None,
 ) -> str:
-    return json.dumps(build_missed_objects_feature_collection(rows, aoi_utm=aoi_utm))
+    return json.dumps(
+        build_missed_objects_feature_collection(rows, aoi_utm=aoi_utm, clip_utm=clip_utm)
+    )
