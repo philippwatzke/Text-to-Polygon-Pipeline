@@ -16,6 +16,7 @@ MASK_COMPONENT_MERGE_GAP_M = 0.8
 
 
 def keep_center_only(masks: Iterable[MaskResult], tile: Tile) -> list[MaskResult]:
+    """Inputs: Iterable[MaskResult], Tile. Logic: keep masks whose box center belongs to the tile ownership area. Returns: list[MaskResult]."""
     margin = tile.center_margin
     lo = margin
     hi = tile.size - margin
@@ -37,6 +38,7 @@ def keep_center_only(masks: Iterable[MaskResult], tile: Tile) -> list[MaskResult
 
 
 def extract_polygons(geom) -> list[Polygon]:
+    """Inputs: shapely geometry. Logic: flatten Polygon, MultiPolygon, or GeometryCollection to non-empty polygons. Returns: list[Polygon]."""
     if isinstance(geom, Polygon):
         return [geom] if not geom.is_empty else []
     if isinstance(geom, MultiPolygon):
@@ -49,8 +51,13 @@ def extract_polygons(geom) -> list[Polygon]:
     return []
 
 
-def _polygon_iou(a: Polygon, b: Polygon) -> float:
-    inter_area = a.intersection(b).area
+def _intersection_area(a: Polygon, b: Polygon) -> float:
+    """Inputs: Polygon, Polygon. Logic: compute the geometric intersection area. Returns: float."""
+    return float(a.intersection(b).area)
+
+
+def _polygon_iou_from_intersection(a: Polygon, b: Polygon, inter_area: float) -> float:
+    """Inputs: Polygon, Polygon, float. Logic: compute IoU from a precomputed intersection area. Returns: float."""
     if inter_area <= 0.0:
         return 0.0
     union_area = a.area + b.area - inter_area
@@ -59,8 +66,8 @@ def _polygon_iou(a: Polygon, b: Polygon) -> float:
     return inter_area / union_area
 
 
-def _polygon_containment(a: Polygon, b: Polygon) -> float:
-    inter_area = a.intersection(b).area
+def _polygon_containment_from_intersection(a: Polygon, b: Polygon, inter_area: float) -> float:
+    """Inputs: Polygon, Polygon, float. Logic: compute smaller-polygon containment from a precomputed intersection area. Returns: float."""
     if inter_area <= 0.0:
         return 0.0
     min_area = min(a.area, b.area)
@@ -70,6 +77,7 @@ def _polygon_containment(a: Polygon, b: Polygon) -> float:
 
 
 def _buffered_coverage(fragment: Polygon, base: Polygon, buffer_m: float) -> float:
+    """Inputs: Polygon, Polygon, float. Logic: measure how much of a fragment lies inside a buffered base polygon. Returns: float."""
     if fragment.area <= 0.0:
         return 0.0
     base_geom = base.buffer(buffer_m) if buffer_m > 0.0 else base
@@ -87,6 +95,7 @@ def _is_fragment_of(
     max_area_ratio: float,
     buffer_m: float,
 ) -> bool:
+    """Inputs: Polygon, Polygon, float thresholds. Logic: test whether one polygon is a small covered fragment of another. Returns: bool."""
     if fragment.area <= 0.0 or base.area <= 0.0:
         return False
     if fragment.area / base.area > max_area_ratio:
@@ -103,16 +112,7 @@ def global_polygon_nms(
     fragment_max_area_ratio: float = 0.0,
     fragment_buffer_m: float = 0.0,
 ) -> gpd.GeoDataFrame:
-    """Suppress duplicate final polygons after tile merge.
-
-    `local_mask_nms` removes duplicate masks inside one SAM tile. This second
-    NMS stage operates in map coordinates across the whole job, after
-    center-ownership clipping and multimodal filtering. It keeps the highest
-    scoring polygon and suppresses lower-priority polygons when either their
-    IoU is high or the smaller polygon is almost contained in the larger one.
-    The optional fragment rule catches low-IoU artifacts that lie mostly on a
-    larger survivor after a small metric buffer, which is common on roof edges.
-    """
+    """Inputs: GeoDataFrame and float thresholds. Logic: suppress lower-priority overlapping polygons using deterministic spatial-indexed NMS. Returns: GeoDataFrame."""
     if gdf is None or len(gdf) <= 1:
         return gdf
     if iou_threshold >= 1.0 and containment_ratio >= 1.0:
@@ -151,10 +151,11 @@ def global_polygon_nms(
                 continue
 
             existing = work.geometry.iloc[existing_pos]
-            if _polygon_iou(geom, existing) >= iou_threshold:
+            inter_area = _intersection_area(geom, existing)
+            if _polygon_iou_from_intersection(geom, existing, inter_area) >= iou_threshold:
                 drop = True
                 break
-            containment = _polygon_containment(geom, existing)
+            containment = _polygon_containment_from_intersection(geom, existing, inter_area)
             if containment >= containment_ratio and geom.area <= existing.area:
                 drop = True
                 break
@@ -199,6 +200,7 @@ def masks_to_polygons(
     *,
     min_area_m2: float,
 ) -> gpd.GeoDataFrame:
+    """Inputs: list[MaskResult], Tile, float. Logic: polygonize binary masks in map coordinates and discard polygons below the area threshold. Returns: GeoDataFrame."""
     records: list[dict] = []
     geometries: list[Polygon] = []
 

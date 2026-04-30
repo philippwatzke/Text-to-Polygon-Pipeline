@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import logging
 import math
+import contextlib
 import os
 import shutil
+import ctypes
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -13,6 +16,78 @@ from ki_geodaten.jobs.store import abort_incomplete_jobs_on_startup, claim_next_
 from ki_geodaten.worker.orchestrator import run_job
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class WorkerLock:
+    path: Path
+    fd: int
+
+    def release(self) -> None:
+        os.close(self.fd)
+        self.path.unlink(missing_ok=True)
+
+
+def acquire_worker_lock(path: Path) -> WorkerLock | None:
+    """Acquire an exclusive process lock for the single-GPU worker.
+
+    SQLite job claiming is atomic, but startup cleanup deliberately marks
+    DOWNLOADING/INFERRING jobs as failed after a worker restart. Running two
+    workers concurrently would therefore make the second one abort the first
+    one's live job. An atomic lock file prevents that class of failure.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    stale_checked = False
+    while True:
+        try:
+            fd = os.open(path, flags)
+        except FileExistsError:
+            if not stale_checked and _remove_stale_worker_lock(path):
+                stale_checked = True
+                continue
+            logger.error("worker lock exists at %s; another worker may be running", path)
+            return None
+        os.write(fd, str(os.getpid()).encode("ascii"))
+        return WorkerLock(path=path, fd=fd)
+
+
+def _remove_stale_worker_lock(path: Path) -> bool:
+    try:
+        pid = int(path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return False
+    if _pid_exists(pid):
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        return False
+    logger.warning("removed stale worker lock at %s for dead pid %s", path, pid)
+    return True
+
+
+def _pid_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(
+            process_query_limited_information,
+            False,
+            pid,
+        )
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _active_job_ids(db_path: Path) -> set[str]:
@@ -165,10 +240,19 @@ def main() -> None:  # pragma: no cover
 
     settings = Settings()
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    worker_lock = acquire_worker_lock(settings.DATA_DIR / "worker.lock")
+    if worker_lock is None:
+        return
+    with contextlib.ExitStack() as stack:
+        stack.callback(worker_lock.release)
+        _run_main(settings, Sam3Segmenter)
+
+
+def _run_main(settings, segmenter_cls) -> None:
     run_forever(
         db_path=settings.DB_PATH,
         data_root=settings.DATA_DIR,
-        segmenter_factory=lambda: Sam3Segmenter(
+        segmenter_factory=lambda: segmenter_cls(
             settings.SAM3_MODEL_ID,
             iou_threshold=settings.LOCAL_MASK_NMS_IOU,
             containment_ratio=settings.LOCAL_MASK_CONTAINMENT_RATIO,

@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
+    """Inputs: BaseException. Logic: check whether the exception is a torch CUDA out-of-memory error. Returns: bool."""
     try:
         import torch
     except Exception:
@@ -51,6 +52,7 @@ def _is_cuda_oom(exc: BaseException) -> bool:
 
 
 def _empty_cuda_cache() -> None:
+    """Inputs: none. Logic: release unused CUDA cache when torch and CUDA are available. Returns: None."""
     try:
         import torch
 
@@ -61,17 +63,20 @@ def _empty_cuda_cache() -> None:
 
 
 def _clear_exception_context(exc: BaseException) -> None:
+    """Inputs: BaseException. Logic: remove traceback and chained exception references from an exception object. Returns: None."""
     exc.__traceback__ = None
     exc.__context__ = None
     exc.__cause__ = None
 
 
 def _traceback_tail(exc: BaseException, n: int = 20) -> str:
+    """Inputs: BaseException, int. Logic: format the final traceback lines for persistence. Returns: str."""
     tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
     return "\n".join(tb.splitlines()[-n:])
 
 
 def _is_system_segmenter_error(exc: BaseException) -> bool:
+    """Inputs: BaseException. Logic: classify setup/import/model availability failures as system segmenter errors. Returns: bool."""
     return isinstance(
         exc,
         (
@@ -84,6 +89,7 @@ def _is_system_segmenter_error(exc: BaseException) -> bool:
 
 
 def _persist_polygons_for_tile(db_path: Path, job_id: str, gdf: gpd.GeoDataFrame) -> None:
+    """Inputs: Path, str, GeoDataFrame. Logic: serialize tile polygons to WKB rows and insert them for a job. Returns: None."""
     if gdf is None or len(gdf) == 0:
         return
     rows = [
@@ -108,6 +114,7 @@ def _apply_global_polygon_nms(
     fragment_max_area_ratio: float,
     fragment_buffer_m: float,
 ) -> None:
+    """Inputs: Path, str, float thresholds. Logic: load all job polygons, apply global polygon NMS, and replace stored rows when polygons were suppressed. Returns: None."""
     rows = get_polygons_for_job(db_path, job_id)
     if len(rows) <= 1:
         return
@@ -149,6 +156,7 @@ def _apply_global_polygon_nms(
 
 
 def _persist_safe_center_nodata(db_path: Path, job_id: str, tile, reason: NoDataReason) -> None:
+    """Inputs: Path, str, tile object, NoDataReason. Logic: persist the tile safe-center geometry as a NoData region. Returns: None."""
     insert_nodata_region(
         db_path,
         job_id,
@@ -160,6 +168,7 @@ def _persist_safe_center_nodata(db_path: Path, job_id: str, tile, reason: NoData
 
 
 def _download_error_reason(exc: DopDownloadError) -> str:
+    """Inputs: DopDownloadError. Logic: map a DOP download exception to a persisted error reason. Returns: str."""
     text = str(exc)
     if text in {ErrorReason.DOP_TIMEOUT, ErrorReason.DOP_HTTP_ERROR}:
         return text
@@ -167,6 +176,7 @@ def _download_error_reason(exc: DopDownloadError) -> str:
 
 
 def _load_modality_thresholds(job: dict) -> ModalityThresholds:
+    """Inputs: dict. Logic: parse the job modality filter JSON into threshold bounds. Returns: ModalityThresholds."""
     raw = job.get("modality_filter")
     if not raw:
         return ModalityThresholds()
@@ -218,6 +228,7 @@ def run_job(
     global_polygon_fragment_max_area_ratio: float = 0.75,
     global_polygon_fragment_buffer_m: float = 1.0,
 ) -> None:
+    """Inputs: job id, paths, segmenter, service config, numeric thresholds. Logic: run download, tiling, inference, multimodal filtering, polygon merge, and status persistence for one job. Returns: None."""
     job = get_job(db_path, job_id)
     if job is None:
         return

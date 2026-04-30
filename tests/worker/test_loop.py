@@ -1,6 +1,7 @@
 from ki_geodaten.jobs.store import get_job, init_schema, insert_job, update_status
 from ki_geodaten.models import JobStatus, TilePreset
-from ki_geodaten.worker.loop import run_forever, startup_cleanup
+import ki_geodaten.worker.loop as worker_loop
+from ki_geodaten.worker.loop import acquire_worker_lock, run_forever, startup_cleanup
 
 
 def _insert(db, jid):
@@ -33,6 +34,31 @@ def test_startup_rmtree_removes_orphan_dirs(tmp_path):
     (orphan / "chunk_0_0.tif").write_bytes(b"x")
     startup_cleanup(db, data_root=tmp_path)
     assert not orphan.exists()
+
+
+def test_worker_lock_prevents_second_worker(tmp_path):
+    lock_path = tmp_path / "worker.lock"
+    first = acquire_worker_lock(lock_path)
+    assert first is not None
+    try:
+        assert acquire_worker_lock(lock_path) is None
+    finally:
+        first.release()
+    assert not lock_path.exists()
+
+
+def test_worker_lock_recovers_stale_dead_pid(tmp_path, monkeypatch):
+    lock_path = tmp_path / "worker.lock"
+    lock_path.write_text("123456", encoding="ascii")
+    monkeypatch.setattr(worker_loop, "_pid_exists", lambda pid: False)
+
+    lock = acquire_worker_lock(lock_path)
+
+    assert lock is not None
+    try:
+        assert int(lock_path.read_text(encoding="ascii")) > 0
+    finally:
+        lock.release()
 
 
 def test_run_forever_exits_after_wall_clock_budget(tmp_path, monkeypatch):
