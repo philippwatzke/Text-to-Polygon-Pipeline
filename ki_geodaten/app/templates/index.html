@@ -41,6 +41,33 @@
           <input id="ndsm-max" type="number" step="0.5" placeholder="100.0">
         </div>
       </details>
+      <details id="vector-topology-panel">
+        <summary>Vector topology</summary>
+        <p class="hint">
+          Simplifies jagged SAM polygon edges. Orthogonalization is optional
+          and guarded by area and shift limits.
+        </p>
+        <div class="panel-row">
+          <label for="simplify-tolerance">Simplify (m)</label>
+          <input id="simplify-tolerance" type="number" step="0.1" min="0" max="10" value="0.3">
+        </div>
+        <label class="checkbox-row">
+          <input id="orthogonalize" type="checkbox">
+          <span>Orthogonalize</span>
+        </label>
+        <div class="panel-row">
+          <label for="orthogonal-angle-tolerance">Angle tolerance</label>
+          <input id="orthogonal-angle-tolerance" type="number" step="1" min="0" max="45" value="12">
+        </div>
+        <div class="panel-row">
+          <label for="orthogonal-area-delta">Max area delta</label>
+          <input id="orthogonal-area-delta" type="number" step="0.05" min="0" max="1" value="0.25">
+        </div>
+        <div class="panel-row">
+          <label for="orthogonal-max-shift">Max shift (m)</label>
+          <input id="orthogonal-max-shift" type="number" step="0.5" min="0" max="20" value="2">
+        </div>
+      </details>
       <button id="submit" type="button">Start</button>
       <button id="export" type="button">Export</button>
       <section id="review-panel" aria-label="Review filters">

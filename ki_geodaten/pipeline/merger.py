@@ -11,6 +11,7 @@ from shapely.validation import make_valid
 
 from ki_geodaten.pipeline.segmenter import MaskResult
 from ki_geodaten.pipeline.tiler import Tile
+from ki_geodaten.pipeline.vector_topology import clean_polygon_topology
 
 MASK_COMPONENT_MERGE_GAP_M = 0.8
 
@@ -199,8 +200,13 @@ def masks_to_polygons(
     tile: Tile,
     *,
     min_area_m2: float,
+    simplify_tolerance_m: float = 0.0,
+    orthogonalize: bool = False,
+    orthogonalize_angle_tolerance_deg: float = 12.0,
+    orthogonalize_max_area_delta_ratio: float = 0.25,
+    orthogonalize_max_shift_m: float = 2.0,
 ) -> gpd.GeoDataFrame:
-    """Inputs: list[MaskResult], Tile, float. Logic: polygonize binary masks in map coordinates and discard polygons below the area threshold. Returns: GeoDataFrame."""
+    """Inputs: list[MaskResult], Tile, topology options, float threshold. Logic: polygonize binary masks, clean vector topology, and discard small polygons. Returns: GeoDataFrame."""
     records: list[dict] = []
     geometries: list[Polygon] = []
 
@@ -234,15 +240,24 @@ def masks_to_polygons(
         if not merged_geom.is_valid:
             merged_geom = make_valid(merged_geom)
         for polygon in extract_polygons(merged_geom):
-            if polygon.area < min_area_m2:
-                continue
-            geometries.append(polygon)
-            records.append(
-                {
-                    "score": float(mask_result.score),
-                    "source_tile_row": tile.tile_row,
-                    "source_tile_col": tile.tile_col,
-                }
+            cleaned_polygons = clean_polygon_topology(
+                polygon,
+                simplify_tolerance_m=simplify_tolerance_m,
+                orthogonalize=orthogonalize,
+                orthogonalize_angle_tolerance_deg=orthogonalize_angle_tolerance_deg,
+                orthogonalize_max_area_delta_ratio=orthogonalize_max_area_delta_ratio,
+                orthogonalize_max_shift_m=orthogonalize_max_shift_m,
             )
+            for cleaned_polygon in cleaned_polygons:
+                if cleaned_polygon.area < min_area_m2:
+                    continue
+                geometries.append(cleaned_polygon)
+                records.append(
+                    {
+                        "score": float(mask_result.score),
+                        "source_tile_row": tile.tile_row,
+                        "source_tile_col": tile.tile_col,
+                    }
+                )
 
     return gpd.GeoDataFrame(records, geometry=geometries, crs="EPSG:25832")

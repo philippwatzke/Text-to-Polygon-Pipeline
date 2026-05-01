@@ -17,6 +17,9 @@ def test_app_starts_and_serves_index(tmp_path, monkeypatch):
     assert "Text-to-Polygon" in response.text
     assert "score-filter" in response.text
     assert "segment-opacity" in response.text
+    assert "vector-topology-panel" in response.text
+    assert "simplify-tolerance" in response.text
+    assert "orthogonalize" in response.text
     assert "reject-below-score" in response.text
     assert "compare-panel" in response.text
     assert "job-search" in response.text
@@ -54,6 +57,12 @@ def test_static_app_includes_job_comparison_tools():
     assert "missed_marked" in app_js
     assert "compare-table" in app_js
     assert "/summary" in app_js
+
+def test_static_app_includes_vector_topology_controls():
+    app_js = __import__("pathlib").Path("ki_geodaten/app/static/app.js").read_text(encoding="utf-8")
+    assert "buildVectorTopology" in app_js
+    assert "vector_topology" in app_js
+    assert "simplify-tolerance" in app_js
 
 
 def test_static_app_includes_job_list_controls():

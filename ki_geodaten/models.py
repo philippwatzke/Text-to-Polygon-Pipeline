@@ -95,11 +95,24 @@ class ModalityFilter(BaseModel):
         return self.ndsm_min is not None or self.ndsm_max is not None
 
 
+class VectorTopology(BaseModel):
+    """Per-job vector simplification and optional orthogonalization settings."""
+    simplify_tolerance_m: float = Field(default=0.3, ge=0.0, le=10.0)
+    orthogonalize: bool = False
+    orthogonalize_angle_tolerance_deg: float = Field(default=12.0, ge=0.0, le=45.0)
+    orthogonalize_max_area_delta_ratio: float = Field(default=0.25, ge=0.0, le=1.0)
+    orthogonalize_max_shift_m: float = Field(default=2.0, ge=0.0, le=20.0)
+
+    def is_active(self) -> bool:
+        return self.simplify_tolerance_m > 0.0 or self.orthogonalize
+
+
 class CreateJobRequest(BaseModel):
     prompt: str = Field(min_length=1)
     bbox_wgs84: list[float] = Field(min_length=4, max_length=4)
     tile_preset: TilePreset = TilePreset.MEDIUM
     modality_filter: ModalityFilter = Field(default_factory=ModalityFilter)
+    vector_topology: VectorTopology = Field(default_factory=VectorTopology)
 
 class ValidationUpdate(BaseModel):
     pid: int

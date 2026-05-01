@@ -7,6 +7,7 @@ from ki_geodaten.models import (
     JobLabelRequest,
     TilePreset,
     ValidateBulkRequest,
+    VectorTopology,
     ValidationUpdate,
 )
 
@@ -23,6 +24,19 @@ def test_bbox_rejects_inverted():
 def test_create_job_request_defaults_preset_to_medium():
     req = CreateJobRequest(prompt="building", bbox_wgs84=[11.0, 48.0, 11.1, 48.1])
     assert req.tile_preset == TilePreset.MEDIUM
+
+
+def test_create_job_request_defaults_vector_topology():
+    req = CreateJobRequest(prompt="building", bbox_wgs84=[11.0, 48.0, 11.1, 48.1])
+    assert req.vector_topology.simplify_tolerance_m == pytest.approx(0.3)
+    assert req.vector_topology.orthogonalize is False
+    assert req.vector_topology.is_active() is True
+
+def test_vector_topology_rejects_out_of_range_values():
+    with pytest.raises(ValidationError):
+        VectorTopology(simplify_tolerance_m=-0.1)
+    with pytest.raises(ValidationError):
+        VectorTopology(orthogonalize_angle_tolerance_deg=60.0)
 
 def test_validate_bulk_request():
     r = ValidateBulkRequest(updates=[ValidationUpdate(pid=1, validation="REJECTED")])

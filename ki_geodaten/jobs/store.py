@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     missed_estimate   INTEGER,
     run_metadata      TEXT,
     modality_filter   TEXT,
+    vector_topology   TEXT,
     created_at        TEXT NOT NULL,
     started_at        TEXT,
     finished_at       TEXT
@@ -101,6 +102,8 @@ def init_schema(db_path: Path) -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN run_metadata TEXT")
         if "modality_filter" not in cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN modality_filter TEXT")
+        if "vector_topology" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN vector_topology TEXT")
         if "label" not in cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN label TEXT")
 
@@ -113,12 +116,13 @@ def insert_job(
     tile_preset: TilePreset,
     run_metadata: dict | None = None,
     modality_filter: dict | None = None,
+    vector_topology: dict | None = None,
 ) -> None:
     with connect(db_path) as conn:
         conn.execute(
             "INSERT INTO jobs(id,prompt,bbox_wgs84,bbox_utm_snapped,tile_preset,"
-            "status,run_metadata,modality_filter,created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            "status,run_metadata,modality_filter,vector_topology,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 job_id,
                 prompt,
@@ -128,6 +132,7 @@ def insert_job(
                 JobStatus.PENDING,
                 json.dumps(run_metadata) if run_metadata is not None else None,
                 json.dumps(modality_filter) if modality_filter is not None else None,
+                json.dumps(vector_topology) if vector_topology is not None else None,
                 _utc_iso(),
             ),
         )
@@ -136,6 +141,11 @@ def get_job(db_path: Path, job_id: str) -> dict | None:
     with connect(db_path) as conn:
         row = conn.execute("SELECT * FROM jobs WHERE id = ?", (job_id,)).fetchone()
     return dict(row) if row else None
+
+def delete_job(db_path: Path, job_id: str) -> bool:
+    with connect(db_path) as conn:
+        cursor = conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        return cursor.rowcount > 0
 
 def update_status(
     db_path: Path, job_id: str, status: JobStatus,

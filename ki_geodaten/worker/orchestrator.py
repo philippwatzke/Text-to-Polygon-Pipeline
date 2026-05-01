@@ -21,7 +21,13 @@ from ki_geodaten.jobs.store import (
     replace_polygons_for_job,
     update_status,
 )
-from ki_geodaten.models import ErrorReason, JobStatus, NoDataReason, TilePreset
+from ki_geodaten.models import (
+    ErrorReason,
+    JobStatus,
+    NoDataReason,
+    TilePreset,
+    VectorTopology,
+)
 from ki_geodaten.pipeline.dem_client import (
     DemDownloadError,
     derive_ndsm_from_dom_dgm,
@@ -193,6 +199,22 @@ def _load_modality_thresholds(job: dict) -> ModalityThresholds:
     )
 
 
+def _load_vector_topology(job: dict) -> VectorTopology:
+    """Inputs: dict. Logic: parse the job vector-topology JSON into topology options. Returns: VectorTopology."""
+    raw = job.get("vector_topology")
+    if not raw:
+        return VectorTopology()
+    try:
+        payload = json.loads(raw)
+    except (TypeError, ValueError):
+        return VectorTopology()
+    try:
+        return VectorTopology(**payload)
+    except Exception:  # noqa: BLE001
+        logger.warning("invalid vector_topology payload ignored for job=%s", job.get("id"))
+        return VectorTopology()
+
+
 def run_job(
     db_path: Path,
     *,
@@ -276,6 +298,7 @@ def run_job(
         update_status(db_path, job_id, JobStatus.INFERRING, tile_total=tile_total)
 
         thresholds = _load_modality_thresholds(job)
+        vector_topology = _load_vector_topology(job)
         ndsm_path: Path | None = None
         if (
             thresholds.needs_ndsm()
@@ -360,7 +383,20 @@ def run_job(
                         ndsm=tile.ndsm,
                         thresholds=thresholds,
                     )
-                gdf = masks_to_polygons(kept, tile, min_area_m2=min_polygon_area_m2)
+                gdf = masks_to_polygons(
+                    kept,
+                    tile,
+                    min_area_m2=min_polygon_area_m2,
+                    simplify_tolerance_m=vector_topology.simplify_tolerance_m,
+                    orthogonalize=vector_topology.orthogonalize,
+                    orthogonalize_angle_tolerance_deg=(
+                        vector_topology.orthogonalize_angle_tolerance_deg
+                    ),
+                    orthogonalize_max_area_delta_ratio=(
+                        vector_topology.orthogonalize_max_area_delta_ratio
+                    ),
+                    orthogonalize_max_shift_m=vector_topology.orthogonalize_max_shift_m,
+                )
                 _persist_polygons_for_tile(db_path, job_id, gdf)
                 increment_tile_completed(db_path, job_id)
             except Exception as exc:  # noqa: BLE001

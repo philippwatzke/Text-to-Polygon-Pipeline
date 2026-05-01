@@ -139,6 +139,14 @@ prompt such as `building`, choose the tile preset, and submit the job. The API
 stores job state in `data/jobs.db`, downloads imagery under `data/dop/`, and
 writes exports under `data/results/`.
 
+Vector topology is part of the per-job request. The default simplifies final
+polygons with `simplify_tolerance_m=0.3` meters to reduce stair-step mask
+artifacts. Orthogonalization is disabled by default; enable it only for classes
+with near-rectangular geometry such as buildings. It snaps near-right-angle
+rings and may prefer a guarded oriented rectangle candidate. Angle, area-delta,
+and maximum-shift limits prevent over-regularization; rejected candidates fall
+back to the validated simplified polygon.
+
 The worker processes one job at a time. Pending jobs stay in `PENDING` until the
 worker claims them.
 
@@ -174,6 +182,8 @@ python -m pytest tests\pipeline\test_sam3_adapter_smoke.py -q -p no:cacheprovide
   SQLite state, model outputs, and experiment artifacts.
 
 ## Known Limits
+- Vector simplification and optional orthogonalization are stored in each job's
+  `run_metadata.vector_topology` snapshot.
 
 - AOIs are restricted to Bavaria.
 - Default maximum AOI size is 1 km2.

@@ -35,6 +35,7 @@ def test_post_jobs_accepts_valid_and_defaults_medium(client):
     assert job is not None
     assert job["tile_preset"] == "medium"
     assert job["status"] == "PENDING"
+    assert job["vector_topology"] is not None
 
 
 def test_post_jobs_persists_run_metadata_snapshot(client):
@@ -48,6 +49,9 @@ def test_post_jobs_persists_run_metadata_snapshot(client):
     assert metadata is not None
     assert metadata["tile_preset"] == "medium"
     assert "settings" in metadata
+    assert metadata["vector_topology"]["simplify_tolerance_m"] == pytest.approx(0.3)
+    assert metadata["vector_topology"]["orthogonalize"] is False
+    assert detail["vector_topology"]["simplify_tolerance_m"] == pytest.approx(0.3)
     assert metadata["settings"]["SAM3_MODEL_ID"] == app.state.settings.SAM3_MODEL_ID
     assert metadata["settings"]["WCS_COVERAGE_ID"] == app.state.settings.WCS_COVERAGE_ID
     assert metadata["settings"]["WCS_URL"] == app.state.settings.WCS_URL
@@ -62,6 +66,45 @@ def test_post_jobs_rejects_outside_bayern(client):
         json={"prompt": "building", "bbox_wgs84": [13.30, 52.40, 13.31, 52.41]},
     )
     assert response.status_code == 422
+
+def test_post_jobs_accepts_vector_topology_options(client):
+    test_client, _ = client
+    response = test_client.post(
+        "/jobs",
+        json={
+            "prompt": "building",
+            "bbox_wgs84": _munich_bbox(),
+            "vector_topology": {
+                "simplify_tolerance_m": 0.5,
+                "orthogonalize": True,
+                "orthogonalize_angle_tolerance_deg": 10.0,
+                "orthogonalize_max_area_delta_ratio": 0.2,
+                "orthogonalize_max_shift_m": 1.0,
+            },
+        },
+    )
+
+    assert response.status_code == 200
+    detail = test_client.get(f"/jobs/{response.json()['id']}").json()
+    assert detail["vector_topology"]["simplify_tolerance_m"] == pytest.approx(0.5)
+    assert detail["vector_topology"]["orthogonalize"] is True
+
+
+def test_post_jobs_persists_disabled_vector_topology(client):
+    test_client, _ = client
+    response = test_client.post(
+        "/jobs",
+        json={
+            "prompt": "building",
+            "bbox_wgs84": _munich_bbox(),
+            "vector_topology": {"simplify_tolerance_m": 0.0, "orthogonalize": False},
+        },
+    )
+
+    assert response.status_code == 200
+    detail = test_client.get(f"/jobs/{response.json()['id']}").json()
+    assert detail["vector_topology"]["simplify_tolerance_m"] == pytest.approx(0.0)
+    assert detail["vector_topology"]["orthogonalize"] is False
 
 
 def test_post_jobs_rejects_area_over_1sqkm(client):

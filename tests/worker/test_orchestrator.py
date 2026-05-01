@@ -1,4 +1,5 @@
 import numpy as np
+import geopandas as gpd
 from affine import Affine
 from pathlib import Path
 
@@ -268,6 +269,65 @@ def test_orchestrator_happy_path_marks_ready(tmp_path, monkeypatch):
     assert job["tile_total"] == 1
     assert job["tile_completed"] == 1
     assert len(get_polygons_for_job(db, "j1")) == 1
+
+
+def test_orchestrator_passes_vector_topology_to_polygonization(tmp_path, monkeypatch):
+    db = tmp_path / "j.db"
+    init_schema(db)
+    insert_job(
+        db,
+        job_id="vector_job",
+        prompt="building",
+        bbox_wgs84=[11.0, 48.0, 11.01, 48.01],
+        bbox_utm_snapped=[691000.0, 5335000.0, 692000.0, 5336000.0],
+        tile_preset=TilePreset.MEDIUM,
+        vector_topology={
+            "simplify_tolerance_m": 0.6,
+            "orthogonalize": True,
+            "orthogonalize_angle_tolerance_deg": 9.0,
+            "orthogonalize_max_area_delta_ratio": 0.2,
+            "orthogonalize_max_shift_m": 1.5,
+        },
+    )
+    mask = np.zeros((1024, 1024), dtype=bool)
+    mask[500:524, 500:524] = True
+    result = MaskResult(mask=mask, score=0.9, box_pixel=(500, 500, 524, 524))
+    captured = {}
+
+    def fake_masks_to_polygons(masks, tile, **kwargs):
+        captured["mask_count"] = len(masks)
+        captured.update(kwargs)
+        return gpd.GeoDataFrame([], geometry=[], crs="EPSG:25832")
+
+    _patch_io(monkeypatch, [_tile()])
+    monkeypatch.setattr(
+        "ki_geodaten.worker.orchestrator.masks_to_polygons",
+        fake_masks_to_polygons,
+    )
+
+    run_job(
+        db,
+        job_id="vector_job",
+        segmenter=StubSegmenter([[result]]),
+        data_root=tmp_path,
+        wcs_url="",
+        coverage_id="by_dop20c",
+        max_pixels=6000,
+        wcs_version="2.0.1",
+        fmt="image/tiff",
+        crs="EPSG:25832",
+        origin_x=0.0,
+        origin_y=0.0,
+        min_polygon_area_m2=0.01,
+        safe_center_nodata_threshold=0.0,
+    )
+
+    assert captured["mask_count"] == 1
+    assert captured["simplify_tolerance_m"] == 0.6
+    assert captured["orthogonalize"] is True
+    assert captured["orthogonalize_angle_tolerance_deg"] == 9.0
+    assert captured["orthogonalize_max_area_delta_ratio"] == 0.2
+    assert captured["orthogonalize_max_shift_m"] == 1.5
 
 
 def test_orchestrator_applies_global_polygon_nms_across_tiles(tmp_path, monkeypatch):

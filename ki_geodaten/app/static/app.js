@@ -563,6 +563,21 @@
     return Number.isFinite(n) ? n : null;
   }
 
+  function readBooleanInput(id) {
+    const el = document.getElementById(id);
+    return Boolean(el?.checked);
+  }
+
+  function buildVectorTopology() {
+    return {
+      simplify_tolerance_m: readNumberInput('simplify-tolerance') ?? 0,
+      orthogonalize: readBooleanInput('orthogonalize'),
+      orthogonalize_angle_tolerance_deg: readNumberInput('orthogonal-angle-tolerance') ?? 12,
+      orthogonalize_max_area_delta_ratio: readNumberInput('orthogonal-area-delta') ?? 0.25,
+      orthogonalize_max_shift_m: readNumberInput('orthogonal-max-shift') ?? 2,
+    };
+  }
+
   function buildModalityFilter() {
     return {
       ndvi_min: readNumberInput('ndvi-min'),
@@ -585,6 +600,7 @@
         bbox_wgs84: bbox,
         tile_preset: presetEl.value,
         modality_filter: buildModalityFilter(),
+        vector_topology: buildVectorTopology(),
       }),
     });
     if (!res.ok) {

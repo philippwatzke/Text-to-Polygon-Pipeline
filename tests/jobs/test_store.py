@@ -49,6 +49,7 @@ def test_init_schema_adds_missed_estimate_to_existing_jobs_table(tmp_path: Path)
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     assert "missed_estimate" in cols
     assert "label" in cols
+    assert "vector_topology" in cols
 
 def test_connect_sets_wal_mode(tmp_path):
     db = tmp_path / "t.db"
@@ -75,6 +76,23 @@ def test_insert_and_get_job(tmp_path):
     assert job["label"] is None
     assert job["validation_revision"] == 0
     assert job["exported_revision"] is None
+
+def test_insert_job_persists_vector_topology(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    jid = "vector-job"
+    insert_job(
+        db, job_id=jid, prompt="building",
+        bbox_wgs84=[11.0, 48.0, 11.1, 48.1],
+        bbox_utm_snapped=[691000.0, 5335000.0, 692000.0, 5336000.0],
+        tile_preset=TilePreset.MEDIUM,
+        vector_topology={"simplify_tolerance_m": 0.5, "orthogonalize": True},
+    )
+
+    job = get_job(db, jid)
+    assert '"simplify_tolerance_m": 0.5' in job["vector_topology"]
+    assert '"orthogonalize": true' in job["vector_topology"]
+
 
 def test_update_job_label(tmp_path):
     db = tmp_path / "t.db"
