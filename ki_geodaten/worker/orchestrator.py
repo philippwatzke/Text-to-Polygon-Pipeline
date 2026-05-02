@@ -99,6 +99,8 @@ def _persist_polygons_for_tile(db_path: Path, job_id: str, gdf: gpd.GeoDataFrame
             "score": float(row["score"]),
             "source_tile_row": int(row["source_tile_row"]),
             "source_tile_col": int(row["source_tile_col"]),
+            "ndvi_mean": row["ndvi_mean"],
+            "ndsm_mean": row["ndsm_mean"],
         }
         for _, row in gdf.iterrows()
     ]
@@ -129,6 +131,8 @@ def _apply_global_polygon_nms(
                 "score": float(row["score"]),
                 "source_tile_row": int(row["source_tile_row"]),
                 "source_tile_col": int(row["source_tile_col"]),
+                "ndvi_mean": row.get("ndvi_mean"),
+                "ndsm_mean": row.get("ndsm_mean"),
             }
         )
 
@@ -150,6 +154,8 @@ def _apply_global_polygon_nms(
             "score": float(row["score"]),
             "source_tile_row": int(row["source_tile_row"]),
             "source_tile_col": int(row["source_tile_col"]),
+            "ndvi_mean": row.get("ndvi_mean"),
+            "ndsm_mean": row.get("ndsm_mean"),
         }
         for _, row in kept.iterrows()
     ]

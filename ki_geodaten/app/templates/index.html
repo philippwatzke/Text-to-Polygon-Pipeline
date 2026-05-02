@@ -3,99 +3,264 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Text-to-Polygon</title>
+  <title>PolySAM Pipeline</title>
+  <link rel="icon" type="image/png" href="/static/flavicon.png">
+  <link rel="apple-touch-icon" href="/static/flavicon.png">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
   <link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-  <main id="app">
-    <aside id="sidebar">
-      <h1>Text-to-Polygon</h1>
-      <textarea id="prompt" placeholder="building"></textarea>
-      <select id="preset">
-        <option value="small">small</option>
-        <option value="medium" selected>medium</option>
-        <option value="large">large</option>
-      </select>
-      <details id="modality-panel">
-        <summary>Modality filter (NDVI / nDSM)</summary>
-        <p class="hint">
-          nDSM wird lokal aus DOM minus DGM berechnet. Wegen unterschiedlicher
-          Erfassungstage ist es nur für nicht bewegliche Objekte belastbar.
-        </p>
-        <div class="panel-row">
-          <label for="ndvi-min">NDVI min</label>
-          <input id="ndvi-min" type="number" step="0.05" min="-1" max="1" placeholder="-1.00">
+  <main id="app" class="app-shell">
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="PolySAM Pipeline home">
+        <img class="brand-logo" src="/static/PolySAM.png" alt="PolySAM">
+      </a>
+      <div class="top-summary">
+        <span id="queue-summary">No active job</span>
+        <span id="worker-status">local review UI</span>
+      </div>
+    </header>
+
+    <section class="workspace">
+      <aside class="panel panel-left" aria-label="Create pipeline job">
+        <section class="section">
+          <div class="section-title">
+            <h1>Text-to-Polygon</h1>
+          </div>
+          <div class="field">
+            <label for="prompt">Target prompt</label>
+            <textarea id="prompt" placeholder="building">building</textarea>
+            <p class="hint">Draw an AOI rectangle on the map before starting a job.</p>
+          </div>
+          <div class="field">
+            <label for="preset">Tile preset</label>
+            <div class="segmented" id="preset-buttons" aria-label="Tile preset selector">
+              <button type="button" data-preset="small">small</button>
+              <button type="button" data-preset="medium" class="active">medium</button>
+              <button type="button" data-preset="large">large</button>
+            </div>
+            <select id="preset" class="visually-hidden" aria-label="Tile preset">
+              <option value="small">small</option>
+              <option value="medium" selected>medium</option>
+              <option value="large">large</option>
+            </select>
+          </div>
+          <div class="metric-pair single">
+            <div class="metric-box">
+              <span>AOI area</span>
+              <strong id="bbox-area">not drawn</strong>
+            </div>
+          </div>
+          <button id="submit" class="primary" type="button">Start job</button>
+          <div id="status" class="status-line" role="status"></div>
+        </section>
+
+        <section id="modality-panel" class="section">
+          <div class="section-title">
+            <h2>Modality filters</h2>
+            <span class="pill">optional</span>
+          </div>
+          <p class="hint">nDSM is derived locally from DOM minus DGM. Use conservative thresholds for buildings and static objects.</p>
+          <div class="control-grid">
+            <div class="field">
+              <label for="ndvi-min">NDVI min</label>
+              <input id="ndvi-min" type="number" step="0.05" min="-1" max="1" placeholder="-1.00">
+            </div>
+            <div class="field">
+              <label for="ndvi-max">NDVI max</label>
+              <input id="ndvi-max" type="number" step="0.05" min="-1" max="1" placeholder="1.00">
+            </div>
+            <div class="field">
+              <label for="ndsm-min">nDSM min (m)</label>
+              <input id="ndsm-min" type="number" step="0.5" placeholder="0.0">
+            </div>
+            <div class="field">
+              <label for="ndsm-max">nDSM max (m)</label>
+              <input id="ndsm-max" type="number" step="0.5" placeholder="100.0">
+            </div>
+          </div>
+        </section>
+
+        <section id="vector-panel" class="section">
+          <div class="section-title">
+            <h2>Vector cleanup</h2>
+            <span class="pill">optional</span>
+          </div>
+          <div class="control-grid">
+            <div class="field">
+              <label for="simplify-tolerance">Simplification (m)</label>
+              <input id="simplify-tolerance" type="number" step="0.1" min="0" placeholder="0.3">
+            </div>
+            <label class="checkbox-card">
+              <input id="orthogonalize" type="checkbox">
+              <span>Orthogonalize rectangular classes</span>
+            </label>
+          </div>
+        </section>
+
+      </aside>
+
+      <section class="map-stage" aria-label="Map and review workspace">
+        <div class="map-frame">
+          <div id="map"></div>
+          <aside id="polygon-diagnostics" class="diagnostic-popup" aria-live="polite">
+            <div class="popup-head">
+              <div>
+                <b id="diagnostic-title">No polygon selected</b>
+                <p id="diagnostic-subtitle" class="hint">Open a review job and click a detection.</p>
+              </div>
+              <span id="diagnostic-state" class="pill">idle</span>
+            </div>
+            <div class="diagnostic-grid">
+              <span>Score<strong id="diagnostic-score">n/a</strong></span>
+              <span>NDVI<strong id="diagnostic-ndvi">n/a</strong></span>
+              <span>nDSM<strong id="diagnostic-ndsm">n/a</strong></span>
+            </div>
+          </aside>
         </div>
-        <div class="panel-row">
-          <label for="ndvi-max">NDVI max</label>
-          <input id="ndvi-max" type="number" step="0.05" min="-1" max="1" placeholder="1.00">
-        </div>
-        <div class="panel-row">
-          <label for="ndsm-min">nDSM min (m)</label>
-          <input id="ndsm-min" type="number" step="0.5" placeholder="0.0">
-        </div>
-        <div class="panel-row">
-          <label for="ndsm-max">nDSM max (m)</label>
-          <input id="ndsm-max" type="number" step="0.5" placeholder="100.0">
-        </div>
-      </details>
-      <button id="submit" type="button">Start</button>
-      <button id="export" type="button">Export</button>
-      <section id="review-panel" aria-label="Review filters">
-        <div class="panel-row">
-          <label for="score-filter">Min score</label>
-          <output id="score-value" for="score-filter">0.00</output>
-        </div>
-        <input id="score-filter" type="range" min="0" max="1" step="0.05" value="0">
-        <div class="panel-row">
-          <label for="segment-opacity">Segment opacity</label>
-          <output id="segment-opacity-value" for="segment-opacity">0.28</output>
-        </div>
-        <input id="segment-opacity" type="range" min="0.05" max="0.8" step="0.05" value="0.28">
-        <label class="checkbox-row">
-          <input id="show-rejected" type="checkbox" checked>
-          <span>Show rejected</span>
-        </label>
-        <button id="reject-below-score" type="button">Reject below score</button>
-        <div id="review-stats"></div>
+
+        <section id="review-panel" class="review-strip" aria-label="Review filters">
+          <div class="review-card">
+            <div class="section-title">
+              <h2 id="open-review-title">Open review</h2>
+              <span id="open-review-status" class="pill">no job</span>
+            </div>
+            <div class="kpi-grid">
+              <div class="kpi"><b id="kpi-accepted">0</b><span>accepted polygons</span></div>
+              <div class="kpi"><b id="kpi-rejected">0</b><span>rejected by review</span></div>
+              <div class="kpi"><b id="kpi-missed">0</b><span>missed objects</span></div>
+            </div>
+            <div class="stats-actions">
+              <button id="export" class="ghost compact" type="button">Export GeoPackage</button>
+              <span id="export-state" class="pill">not exported</span>
+            </div>
+          </div>
+          <div class="review-card">
+            <div class="section-title">
+              <h2>Review controls</h2>
+              <button id="reject-below-score" class="secondary compact" type="button">Reject below score</button>
+            </div>
+            <div class="range-row">
+              <label for="score-filter">Min score</label>
+              <output id="score-value" for="score-filter">0.00</output>
+            </div>
+            <input id="score-filter" type="range" min="0" max="1" step="0.05" value="0">
+            <div class="range-row">
+              <label for="segment-opacity">Segment opacity</label>
+              <output id="segment-opacity-value" for="segment-opacity">0.28</output>
+            </div>
+            <input id="segment-opacity" type="range" min="0.05" max="0.8" step="0.05" value="0.28">
+            <label class="checkbox-row">
+              <input id="show-rejected" type="checkbox" checked>
+              <span>Show rejected</span>
+            </label>
+            <div id="missed-panel" class="inline-actions" aria-label="Missed object annotations">
+              <button id="toggle-missed-mode" class="secondary compact" type="button">Mark misses</button>
+              <span id="missed-stats" class="hint">0 marked | mode off</span>
+            </div>
+            <div id="review-stats" class="hint"></div>
+          </div>
+          <div class="review-card" aria-label="Job presets">
+            <div class="section-title">
+              <h2>Job presets</h2>
+              <button id="save-preset" class="ghost compact" type="button">Save current</button>
+            </div>
+            <div class="field compact-field">
+              <label for="preset-name">Preset name</label>
+              <input id="preset-name" type="text" maxlength="80" placeholder="e.g. Gebäudetest NDVI 0.35">
+            </div>
+            <div class="preset-manager">
+              <div id="preset-list" class="preset-empty">No custom presets yet</div>
+            </div>
+          </div>
+        </section>
+
+        <section id="compare-panel" class="analysis-window" aria-label="Job comparison">
+          <div class="analysis-main">
+            <div class="section-title">
+              <div>
+                <h2>AOI run comparison</h2>
+                <p class="hint">Add open jobs to compare review metrics and score distributions.</p>
+              </div>
+              <button id="add-compare" class="secondary compact" type="button">Add open job</button>
+            </div>
+            <div id="compare-list" class="compare-list">No jobs selected</div>
+          </div>
+          <aside class="analysis-side">
+            <div class="section-title">
+              <h2>Score distribution</h2>
+              <span class="pill">confidence</span>
+            </div>
+            <div id="score-histogram" class="score-buckets" aria-label="Score buckets"></div>
+            <div class="threshold-callout">
+              <b id="threshold-title">No threshold yet</b>
+              <p id="threshold-copy" class="hint">Open a job to inspect accepted and rejected score buckets.</p>
+            </div>
+          </aside>
+        </section>
       </section>
-      <section id="missed-panel" aria-label="Missed object annotations">
-        <div class="panel-row">
-          <strong>Missed objects</strong>
-          <button id="toggle-missed-mode" type="button">Mark misses</button>
-        </div>
-        <div id="missed-stats"></div>
-      </section>
-      <section id="compare-panel" aria-label="Job comparison">
-        <div class="panel-row">
-          <strong>Compare</strong>
-          <button id="add-compare" type="button">Add open job</button>
-        </div>
-        <div id="compare-list"></div>
-      </section>
-      <div id="status"></div>
-      <section id="job-panel" aria-label="Jobs">
-        <div class="panel-row">
-          <strong>Jobs</strong>
-          <span id="job-count"></span>
-        </div>
-        <input id="job-search" type="search" placeholder="Search jobs">
-        <div class="job-filter-row">
-          <label class="checkbox-row">
-            <input id="show-failed-jobs" type="checkbox">
-            <span>Show failed</span>
-          </label>
-          <label class="checkbox-row">
-            <input id="show-exported-jobs" type="checkbox" checked>
-            <span>Show exported</span>
-          </label>
-        </div>
-      </section>
-      <div id="jobs"></div>
-    </aside>
-    <div id="map"></div>
+
+      <aside class="panel panel-right" aria-label="Jobs and diagnostics">
+        <section id="job-panel" class="section" aria-label="Jobs">
+          <div class="section-title">
+            <h2>Jobs</h2>
+            <span id="job-count" class="pill">0/0</span>
+          </div>
+          <input id="job-search" type="search" placeholder="Search jobs">
+          <div class="job-filter-row">
+            <label class="checkbox-row">
+              <input id="show-failed-jobs" type="checkbox">
+              <span>Show failed</span>
+            </label>
+            <label class="checkbox-row">
+              <input id="show-exported-jobs" type="checkbox" checked>
+              <span>Show exported</span>
+            </label>
+          </div>
+          <button id="toggle-all-jobs" class="ghost compact" type="button">Show all jobs</button>
+          <div id="jobs" class="job-list"></div>
+        </section>
+
+        <section id="error-analysis" class="section">
+          <div class="section-title">
+            <h2>Error analysis</h2>
+            <span class="pill">selected job</span>
+          </div>
+          <div class="detail-table">
+            <div><span>Precision proxy</span><strong id="error-precision">n/a</strong></div>
+            <div><span>Recall estimate</span><strong id="error-recall">n/a</strong></div>
+            <div><span>Rejected share</span><strong id="error-rejected-share">n/a</strong></div>
+            <div><span>Low-score detections</span><strong id="error-low-score">n/a</strong></div>
+            <div><span>Failed tiles</span><strong id="error-failed-tiles">n/a</strong></div>
+            <div><span>Score range</span><strong id="error-score-range">n/a</strong></div>
+          </div>
+        </section>
+
+        <section id="job-details" class="section">
+          <div class="section-title">
+            <h2>Selected job detail</h2>
+            <button id="copy-metadata" class="ghost compact" type="button">Copy metadata</button>
+          </div>
+          <div class="detail-table">
+            <div><span>Prompt</span><strong id="detail-prompt">n/a</strong></div>
+            <div><span>BBox WGS84</span><strong id="detail-bbox">n/a</strong></div>
+            <div><span>Tile preset</span><strong id="detail-preset">n/a</strong></div>
+            <div><span>Vector cleanup</span><strong id="detail-vector">n/a</strong></div>
+            <div><span>Modality</span><strong id="detail-modality">n/a</strong></div>
+            <div><span>Status</span><strong id="detail-status">n/a</strong></div>
+            <div><span>Tiles</span><strong id="detail-tiles">n/a</strong></div>
+            <div><span>Revision</span><strong id="detail-revision">n/a</strong></div>
+            <div><span>Export</span><strong id="detail-export-stale">n/a</strong></div>
+            <div><span>Created</span><strong id="detail-created">n/a</strong></div>
+            <div><span>Runtime</span><strong id="detail-runtime">n/a</strong></div>
+            <div><span>Model</span><strong id="detail-model">n/a</strong></div>
+            <div><span>Preprocess</span><strong id="detail-preprocess">n/a</strong></div>
+            <div><span>Git SHA</span><strong id="detail-git">n/a</strong></div>
+          </div>
+        </section>
+      </aside>
+    </section>
   </main>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js"></script>

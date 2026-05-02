@@ -52,15 +52,24 @@ def build_polygons_feature_collection(
         if clip.is_empty or not geom.intersects(clip):
             continue
         for transformed in _clip_transform_precision(geom, clip):
+            properties = {
+                "id": row["id"],
+                "score": row["score"],
+                "validation": row["validation"],
+            }
+            if row.get("ndvi_mean") is not None:
+                properties["ndvi_mean"] = row["ndvi_mean"]
+            if row.get("ndsm_mean") is not None:
+                properties["ndsm_mean"] = row["ndsm_mean"]
+            if row.get("source_tile_row") is not None:
+                properties["source_tile_row"] = row["source_tile_row"]
+            if row.get("source_tile_col") is not None:
+                properties["source_tile_col"] = row["source_tile_col"]
             features.append(
                 {
                     "type": "Feature",
                     "geometry": mapping(transformed),
-                    "properties": {
-                        "id": row["id"],
-                        "score": row["score"],
-                        "validation": row["validation"],
-                    },
+                    "properties": properties,
                 }
             )
     return _feature_collection(features)

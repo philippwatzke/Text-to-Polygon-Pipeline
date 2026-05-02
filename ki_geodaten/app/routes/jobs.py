@@ -23,6 +23,7 @@ from ki_geodaten.jobs.store import (
     insert_missed_object,
     list_jobs,
     delete_missed_object,
+    delete_job,
     update_job_label,
     update_status,
     update_missed_estimate,
@@ -143,10 +144,14 @@ async def create_job(req: CreateJobRequest, request: Request):
 
     job_id = str(uuid.uuid4())
     modality_filter_dict = req.modality_filter.model_dump()
+    vector_options_dict = req.vector_options.model_dump()
     run_metadata = build_run_metadata(
         settings,
         tile_preset=req.tile_preset,
-        extra={"modality_filter": modality_filter_dict},
+        extra={
+            "modality_filter": modality_filter_dict,
+            "vector_options": vector_options_dict,
+        },
     )
     insert_job(
         request.app.state.db_path,
@@ -172,6 +177,28 @@ async def get_job_endpoint(job_id: str, request: Request):
     if job is None:
         raise HTTPException(404, "job not found")
     return _job_view(job)
+
+
+@router.delete("/jobs/{job_id}")
+def delete_job_endpoint(job_id: str, request: Request):
+    job = get_job(request.app.state.db_path, job_id)
+    if job is None:
+        raise HTTPException(404, "job not found")
+    if job["status"] in {"DOWNLOADING", "INFERRING"}:
+        raise HTTPException(409, "running jobs cannot be deleted")
+
+    deleted = delete_job(request.app.state.db_path, job_id)
+    if deleted:
+        shutil.rmtree(request.app.state.data_root / "dop" / job_id, ignore_errors=True)
+        gpkg_path = job.get("gpkg_path")
+        if gpkg_path:
+            Path(gpkg_path).unlink(missing_ok=True)
+            Path(gpkg_path).with_suffix(".gpkg-wal").unlink(missing_ok=True)
+            Path(gpkg_path).with_suffix(".gpkg-shm").unlink(missing_ok=True)
+        for key in list(request.app.state.geojson_cache.keys()):
+            if key[0] == job_id:
+                del request.app.state.geojson_cache[key]
+    return {"deleted": deleted}
 
 
 @router.get("/jobs/{job_id}/summary")

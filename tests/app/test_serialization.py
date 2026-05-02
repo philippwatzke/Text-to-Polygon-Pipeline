@@ -47,6 +47,36 @@ def test_polygons_precision_capped_at_1e_6():
             assert abs(value - round(value, 6)) < 1e-9
 
 
+def test_polygons_geojson_includes_diagnostic_properties_when_present():
+    poly = Polygon(
+        [(691100, 5335100), (691200, 5335100), (691200, 5335200), (691100, 5335200)]
+    )
+    rows = [
+        {
+            "id": 1,
+            "geometry_wkb": _poly_wkb(poly),
+            "score": 0.88,
+            "validation": "ACCEPTED",
+            "source_tile_row": 12,
+            "source_tile_col": 8,
+            "ndvi_mean": 0.31,
+            "ndsm_mean": 3.4,
+        }
+    ]
+
+    fc = build_polygons_feature_collection(rows, aoi_utm=_aoi_utm())
+
+    assert fc["features"][0]["properties"] == {
+        "id": 1,
+        "score": 0.88,
+        "validation": "ACCEPTED",
+        "source_tile_row": 12,
+        "source_tile_col": 8,
+        "ndvi_mean": 0.31,
+        "ndsm_mean": 3.4,
+    }
+
+
 def test_polygons_clip_by_aoi_and_drop_fully_outside():
     crossing = Polygon(
         [(691900, 5335500), (692200, 5335500), (692200, 5335600), (691900, 5335600)]

@@ -95,11 +95,17 @@ class ModalityFilter(BaseModel):
         return self.ndsm_min is not None or self.ndsm_max is not None
 
 
+class VectorOptions(BaseModel):
+    simplification_tolerance_m: float | None = Field(default=None, ge=0.0)
+    orthogonalize: bool = False
+
+
 class CreateJobRequest(BaseModel):
     prompt: str = Field(min_length=1)
     bbox_wgs84: list[float] = Field(min_length=4, max_length=4)
     tile_preset: TilePreset = TilePreset.MEDIUM
     modality_filter: ModalityFilter = Field(default_factory=ModalityFilter)
+    vector_options: VectorOptions = Field(default_factory=VectorOptions)
 
 class ValidationUpdate(BaseModel):
     pid: int

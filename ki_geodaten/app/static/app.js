@@ -1,5 +1,6 @@
 (function () {
-  const map = L.map('map').setView([48.137, 11.575], 12);
+  const map = L.map('map', {zoomControl: false}).setView([48.137, 11.575], 12);
+
   const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     maxZoom: 20,
     attribution: '&copy; OpenStreetMap contributors',
@@ -13,10 +14,10 @@
     attribution: '&copy; Bayerische Vermessungsverwaltung, CC BY 4.0',
   });
   const baseLayers = {
-    'OSM': osmLayer,
-    'DOP20': dopLayer,
+    OSM: osmLayer,
+    DOP20: dopLayer,
   };
-  osmLayer.addTo(map);
+  dopLayer.addTo(map);
   L.control.layers(baseLayers, null, {position: 'topright'}).addTo(map);
 
   const drawnItems = new L.FeatureGroup();
@@ -28,13 +29,21 @@
       circle: false,
       marker: false,
       circlemarker: false,
-      rectangle: true,
+      rectangle: {
+        shapeOptions: {
+          color: '#2563eb',
+          fillColor: '#2563eb',
+          fillOpacity: 0.08,
+          weight: 2,
+        },
+      },
     },
-    edit: { featureGroup: drawnItems },
+    edit: {featureGroup: drawnItems},
   }));
 
   const promptEl = document.getElementById('prompt');
   const presetEl = document.getElementById('preset');
+  const presetButtonsEl = document.getElementById('preset-buttons');
   const statusEl = document.getElementById('status');
   const jobsEl = document.getElementById('jobs');
   const submitEl = document.getElementById('submit');
@@ -51,12 +60,65 @@
   const addCompareEl = document.getElementById('add-compare');
   const compareListEl = document.getElementById('compare-list');
   const jobSearchEl = document.getElementById('job-search');
+  const globalSearchEl = document.getElementById('global-search');
   const showFailedJobsEl = document.getElementById('show-failed-jobs');
   const showExportedJobsEl = document.getElementById('show-exported-jobs');
+  const toggleAllJobsEl = document.getElementById('toggle-all-jobs');
   const jobCountEl = document.getElementById('job-count');
+  const bboxAreaEl = document.getElementById('bbox-area');
+  const simplifyToleranceEl = document.getElementById('simplify-tolerance');
+  const orthogonalizeEl = document.getElementById('orthogonalize');
+  const presetNameEl = document.getElementById('preset-name');
+  const savePresetEl = document.getElementById('save-preset');
+  const customPresetListEl = document.getElementById('preset-list');
+
+  const kpiAcceptedEl = document.getElementById('kpi-accepted');
+  const kpiRejectedEl = document.getElementById('kpi-rejected');
+  const kpiMissedEl = document.getElementById('kpi-missed');
+  const openReviewTitleEl = document.getElementById('open-review-title');
+  const openReviewStatusEl = document.getElementById('open-review-status');
+  const scoreHistogramEl = document.getElementById('score-histogram');
+  const thresholdTitleEl = document.getElementById('threshold-title');
+  const thresholdCopyEl = document.getElementById('threshold-copy');
+  const workerStatusEl = document.getElementById('worker-status');
+  const queueSummaryEl = document.getElementById('queue-summary');
+  const exportStateEl = document.getElementById('export-state');
+  const copyMetadataEl = document.getElementById('copy-metadata');
+
+  const diagnostic = {
+    title: document.getElementById('diagnostic-title'),
+    subtitle: document.getElementById('diagnostic-subtitle'),
+    state: document.getElementById('diagnostic-state'),
+    score: document.getElementById('diagnostic-score'),
+    ndvi: document.getElementById('diagnostic-ndvi'),
+    ndsm: document.getElementById('diagnostic-ndsm'),
+  };
+  const detail = {
+    precision: document.getElementById('error-precision'),
+    recall: document.getElementById('error-recall'),
+    rejectedShare: document.getElementById('error-rejected-share'),
+    lowScore: document.getElementById('error-low-score'),
+    failedTiles: document.getElementById('error-failed-tiles'),
+    scoreRange: document.getElementById('error-score-range'),
+    prompt: document.getElementById('detail-prompt'),
+    bbox: document.getElementById('detail-bbox'),
+    preset: document.getElementById('detail-preset'),
+    vector: document.getElementById('detail-vector'),
+    modality: document.getElementById('detail-modality'),
+    status: document.getElementById('detail-status'),
+    tiles: document.getElementById('detail-tiles'),
+    revision: document.getElementById('detail-revision'),
+    exportStale: document.getElementById('detail-export-stale'),
+    created: document.getElementById('detail-created'),
+    runtime: document.getElementById('detail-runtime'),
+    model: document.getElementById('detail-model'),
+    preprocess: document.getElementById('detail-preprocess'),
+    git: document.getElementById('detail-git'),
+  };
 
   let bbox = null;
   let currentJobId = null;
+  let currentJobSummary = null;
   let polygonLayer = null;
   let nodataLayer = null;
   let missedLayer = null;
@@ -64,23 +126,105 @@
   let currentMissedObjects = null;
   let latestJobs = [];
   let missedMode = false;
+  let showAllJobs = false;
   let comparisonJobIds = loadComparisonJobIds();
   const pendingUpdates = new Map();
   let flushTimer = null;
   let isFlushing = false;
   const MAX_CLIENT_BUFFER_UPDATES = 100;
 
+  setTimeout(() => map.invalidateSize(), 0);
+
+  function aoiStyle() {
+    return {
+      color: '#2563eb',
+      fillColor: '#2563eb',
+      fillOpacity: 0.08,
+      weight: 2,
+    };
+  }
+
+  function setDrawnBbox(values, {fit = false} = {}) {
+    if (!Array.isArray(values) || values.length !== 4) return;
+    bbox = values.map(Number);
+    bboxAreaEl.textContent = `${bboxAreaKm2(bbox).toFixed(3)} km2`;
+    drawnItems.clearLayers();
+    const bounds = L.latLngBounds(
+      [bbox[1], bbox[0]],
+      [bbox[3], bbox[2]],
+    );
+    L.rectangle(bounds, aoiStyle()).addTo(drawnItems);
+    if (fit) map.fitBounds(bounds.pad(0.12), {maxZoom: 18});
+  }
+
+  function updateBboxFromDrawnItems() {
+    let layer = null;
+    drawnItems.eachLayer((item) => {
+      if (!layer) layer = item;
+    });
+    if (!layer?.getBounds) {
+      bbox = null;
+      bboxAreaEl.textContent = 'not drawn';
+      return;
+    }
+    const b = layer.getBounds();
+    bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+    bboxAreaEl.textContent = `${bboxAreaKm2(bbox).toFixed(3)} km2`;
+  }
+
   map.on(L.Draw.Event.CREATED, (event) => {
     drawnItems.clearLayers();
+    if (event.layer.setStyle) {
+      event.layer.setStyle(aoiStyle());
+    }
     drawnItems.addLayer(event.layer);
-    const b = event.layer.getBounds();
-    bbox = [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()];
+    updateBboxFromDrawnItems();
+    statusEl.textContent = 'AOI selected';
+  });
+
+  map.on(L.Draw.Event.EDITED, () => {
+    updateBboxFromDrawnItems();
+    statusEl.textContent = bbox ? 'AOI updated' : 'AOI removed';
+  });
+
+  map.on(L.Draw.Event.DELETED, () => {
+    updateBboxFromDrawnItems();
+    statusEl.textContent = 'AOI removed';
   });
 
   map.on('click', (event) => {
     if (!missedMode || !currentJobId) return;
     void addMissedObject(event.latlng);
   });
+
+  presetButtonsEl?.addEventListener('click', (event) => {
+    const button = event.target.closest('button[data-preset]');
+    if (!button) return;
+    presetEl.value = button.dataset.preset;
+    renderPresetButtons();
+  });
+
+  presetEl.addEventListener('change', renderPresetButtons);
+
+  globalSearchEl?.addEventListener('input', () => {
+    jobSearchEl.value = globalSearchEl.value;
+    renderJobs();
+  });
+
+  function bboxAreaKm2(values) {
+    if (!values) return 0;
+    const [minLon, minLat, maxLon, maxLat] = values.map(Number);
+    const meanLat = ((minLat + maxLat) / 2) * Math.PI / 180;
+    const widthKm = Math.abs(maxLon - minLon) * 111.32 * Math.cos(meanLat);
+    const heightKm = Math.abs(maxLat - minLat) * 110.57;
+    return widthKm * heightKm;
+  }
+
+  function renderPresetButtons() {
+    presetButtonsEl?.querySelectorAll('button[data-preset]').forEach((button) => {
+      button.classList.toggle('active', button.dataset.preset === presetEl.value);
+    });
+  }
 
   function storageKey(jobId) {
     return `job:${jobId}:pending-validations`;
@@ -113,10 +257,10 @@
     const underFilter = score < Number(scoreFilterEl.value || 0);
     const fill = Number(segmentOpacityEl.value || 0.28);
     return {
-      color: accepted ? '#2563eb' : '#dc2626',
-      fillColor: accepted ? '#60a5fa' : '#f87171',
-      fillOpacity: underFilter ? Math.max(0.03, fill * 0.3) : fill,
-      opacity: underFilter ? 0.35 : Math.min(1, fill + 0.35),
+      color: accepted ? '#2563eb' : '#c24135',
+      fillColor: accepted ? '#60a5fa' : '#f07f72',
+      fillOpacity: underFilter ? Math.max(0.035, fill * 0.32) : fill,
+      opacity: underFilter ? 0.36 : Math.min(1, fill + 0.45),
       weight: underFilter ? 1 : 2,
     };
   }
@@ -153,8 +297,15 @@
     scoreValueEl.value = Number(scoreFilterEl.value || 0).toFixed(2);
     segmentOpacityValueEl.value = Number(segmentOpacityEl.value || 0.28).toFixed(2);
     const counts = reviewCounts();
-    reviewStatsEl.textContent =
-      `${counts.visible}/${counts.total} visible | ${counts.accepted} accepted | ${counts.rejected} rejected | ${counts.acceptedBelow} below score`;
+    const threshold = Number(scoreFilterEl.value || 0);
+    reviewStatsEl.textContent = !currentPolygons
+      ? 'Open a job to review detections.'
+      : (threshold > 0
+        ? `${counts.visible} detections shown after score filter`
+        : 'Score filter is off');
+    kpiAcceptedEl.textContent = String(counts.accepted);
+    kpiRejectedEl.textContent = String(counts.rejected);
+    renderScoreHistogram();
   }
 
   function compareStorageKey() {
@@ -182,12 +333,179 @@
     return value === null || value === undefined ? 'n/a' : Number(value).toFixed(3);
   }
 
+  function formatDateTime(value) {
+    return value ? new Date(value).toLocaleString() : 'n/a';
+  }
+
+  function formatRuntime(started, finished) {
+    if (!started) return 'n/a';
+    const end = finished ? new Date(finished) : new Date();
+    const seconds = Math.max(0, Math.round((end - new Date(started)) / 1000));
+    if (seconds < 60) return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const rest = seconds % 60;
+    return `${minutes}m ${rest}s`;
+  }
+
+  function formatBbox(values) {
+    if (!Array.isArray(values) || values.length !== 4) return 'n/a';
+    const nums = values.map(Number);
+    if (nums.some(value => !Number.isFinite(value))) return 'n/a';
+    return `${nums[0].toFixed(5)}, ${nums[1].toFixed(5)} to ${nums[2].toFixed(5)}, ${nums[3].toFixed(5)}`;
+  }
+
+  function cleanFilter(filter) {
+    if (!filter) return {};
+    return Object.fromEntries(
+      Object.entries(filter).filter(([, value]) => value !== null && value !== undefined),
+    );
+  }
+
+  function formatModality(filter) {
+    const active = cleanFilter(filter);
+    const parts = [];
+    if (active.ndvi_min !== undefined) parts.push(`NDVI >= ${active.ndvi_min}`);
+    if (active.ndvi_max !== undefined) parts.push(`NDVI <= ${active.ndvi_max}`);
+    if (active.ndsm_min !== undefined) parts.push(`nDSM >= ${active.ndsm_min}m`);
+    if (active.ndsm_max !== undefined) parts.push(`nDSM <= ${active.ndsm_max}m`);
+    return parts.length ? parts.join(', ') : 'none';
+  }
+
+  function formatVectorOptions(options) {
+    if (!options) return 'none';
+    const tolerance = options.simplification_tolerance_m;
+    const simplify = tolerance !== null && tolerance !== undefined && tolerance !== ''
+      ? `simplify ${tolerance}m`
+      : 'no simplification';
+    return `${simplify}, ortho ${options.orthogonalize ? 'on' : 'off'}`;
+  }
+
+  function applyModalityFilter(filter) {
+    setNumberInput('ndvi-min', filter?.ndvi_min);
+    setNumberInput('ndvi-max', filter?.ndvi_max);
+    setNumberInput('ndsm-min', filter?.ndsm_min);
+    setNumberInput('ndsm-max', filter?.ndsm_max);
+  }
+
+  function applyVectorOptions(options) {
+    if (simplifyToleranceEl) {
+      simplifyToleranceEl.value = options?.simplification_tolerance_m ?? '';
+    }
+    if (orthogonalizeEl) {
+      orthogonalizeEl.checked = Boolean(options?.orthogonalize);
+    }
+  }
+
+  function customPresetStorageKey() {
+    return 'polysam:custom-job-presets';
+  }
+
+  function loadCustomPresets() {
+    try {
+      const parsed = JSON.parse(localStorage.getItem(customPresetStorageKey()) || '[]');
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (err) {
+      return [];
+    }
+  }
+
+  function saveCustomPresets(presets) {
+    localStorage.setItem(customPresetStorageKey(), JSON.stringify(presets));
+  }
+
+  function currentPresetPayload(name) {
+    return {
+      id: window.crypto?.randomUUID ? window.crypto.randomUUID() : String(Date.now()),
+      name,
+      prompt: promptEl.value.trim(),
+      tilePreset: presetEl.value,
+      modalityFilter: buildModalityFilter(),
+      vectorOptions: buildVectorOptions(),
+      createdAt: new Date().toISOString(),
+    };
+  }
+
+  function presetSubtitle(preset) {
+    const parts = [
+      preset.tilePreset || 'medium',
+      formatModality(preset.modalityFilter),
+      formatVectorOptions(preset.vectorOptions),
+    ].filter(Boolean);
+    return parts.join(' | ');
+  }
+
+  function applyCustomPreset(preset) {
+    promptEl.value = preset.prompt || '';
+    presetEl.value = preset.tilePreset || 'medium';
+    renderPresetButtons();
+    applyModalityFilter(preset.modalityFilter || {});
+    applyVectorOptions(preset.vectorOptions || {});
+    statusEl.textContent = `Preset applied: ${preset.name}`;
+  }
+
+  function deleteCustomPreset(presetId) {
+    const presets = loadCustomPresets().filter(preset => preset.id !== presetId);
+    saveCustomPresets(presets);
+    renderCustomPresets();
+  }
+
+  function renderCustomPresets() {
+    if (!customPresetListEl) return;
+    const presets = loadCustomPresets();
+    customPresetListEl.innerHTML = '';
+    if (!presets.length) {
+      customPresetListEl.className = 'preset-empty';
+      customPresetListEl.textContent = 'No custom presets yet';
+      return;
+    }
+    customPresetListEl.className = 'preset-list';
+    presets.forEach((preset) => {
+      const card = document.createElement('article');
+      card.className = 'preset-card';
+      const title = document.createElement('b');
+      title.textContent = preset.name || preset.prompt || 'Preset';
+      const actions = document.createElement('div');
+      actions.className = 'preset-actions';
+      const apply = document.createElement('button');
+      apply.type = 'button';
+      apply.textContent = 'Apply';
+      apply.onclick = () => applyCustomPreset(preset);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = 'Delete';
+      remove.onclick = () => deleteCustomPreset(preset.id);
+      actions.append(apply, remove);
+      const subtitle = document.createElement('span');
+      subtitle.textContent = presetSubtitle(preset);
+      card.append(title, actions, subtitle);
+      customPresetListEl.append(card);
+    });
+  }
+
+  function saveCurrentPreset() {
+    const fallback = promptEl.value.trim() || 'Untitled preset';
+    const name = (presetNameEl?.value || fallback).trim();
+    const presets = loadCustomPresets();
+    presets.unshift(currentPresetPayload(name));
+    saveCustomPresets(presets.slice(0, 30));
+    if (presetNameEl) presetNameEl.value = '';
+    renderCustomPresets();
+    statusEl.textContent = `Preset saved: ${name}`;
+  }
+
   function jobName(job) {
     return job?.label || job?.prompt || job?.id || 'job';
   }
 
   function shortId(id) {
     return String(id || '').slice(0, 8);
+  }
+
+  function statusClass(status) {
+    if (status === 'READY_FOR_REVIEW' || status === 'EXPORTED') return 'ready';
+    if (status === 'FAILED') return 'failed';
+    if (status === 'DOWNLOADING' || status === 'INFERRING') return 'warn';
+    return '';
   }
 
   function jobMatchesFilters(job) {
@@ -204,10 +522,14 @@
     ].filter(Boolean).some(value => String(value).toLowerCase().includes(q));
   }
 
-  async function fetchJobSummary(jobId) {
-    const res = await fetch(`/jobs/${jobId}/summary`);
+  async function fetchJson(url) {
+    const res = await fetch(url);
     if (!res.ok) return null;
     return res.json();
+  }
+
+  async function fetchJobSummary(jobId) {
+    return fetchJson(`/jobs/${jobId}/summary`);
   }
 
   async function renderComparison() {
@@ -287,29 +609,37 @@
       filter: passesReviewFilter,
       style: featureStyle,
       onEachFeature: (feature, layer) => {
-        const score = Number(feature.properties.score || 0).toFixed(3);
-        const validation = feature.properties.validation || 'ACCEPTED';
-        layer.bindPopup(
-          `Score: ${score}<br>Status: ${validation}<br>ID: ${feature.properties.id}`
-        );
         layer.on('click', () => {
           feature.properties.validation =
             feature.properties.validation === 'ACCEPTED' ? 'REJECTED' : 'ACCEPTED';
-          layer.setStyle(featureStyle(feature));
-          layer.setPopupContent(
-            `Score: ${score}<br>Status: ${feature.properties.validation}<br>ID: ${feature.properties.id}`
-          );
           queueValidation(feature.properties.id, feature.properties.validation);
+          updateDiagnostic(feature);
           renderPolygons();
         });
+        layer.on('mouseover', () => updateDiagnostic(feature));
       },
     }).addTo(map);
     renderReviewStats();
   }
 
+  function updateDiagnostic(feature) {
+    const props = feature?.properties || {};
+    const score = props.score === undefined ? 'n/a' : Number(props.score).toFixed(3);
+    diagnostic.title.textContent = props.id ? 'Polygon selected' : 'No polygon selected';
+    diagnostic.subtitle.textContent = currentJobSummary
+      ? `${currentJobSummary.prompt} / ${currentJobSummary.tile_preset}${props.id ? ` / id ${props.id}` : ''}`
+      : 'Open a review job and click a detection.';
+    diagnostic.state.textContent = props.validation || 'idle';
+    diagnostic.state.className = `pill ${props.validation ? (props.validation === 'REJECTED' ? 'failed' : 'ready') : ''}`;
+    diagnostic.score.textContent = score;
+    diagnostic.ndvi.textContent = props.ndvi_mean === undefined ? 'n/a' : Number(props.ndvi_mean).toFixed(3);
+    diagnostic.ndsm.textContent = props.ndsm_mean === undefined ? 'n/a' : `${Number(props.ndsm_mean).toFixed(2)} m`;
+  }
+
   function renderMissedStats() {
     const count = currentMissedObjects?.features?.length || 0;
     missedStatsEl.textContent = `${count} marked | ${missedMode ? 'click map to add' : 'mode off'}`;
+    kpiMissedEl.textContent = String(count);
     toggleMissedModeEl.classList.toggle('active-mode', missedMode);
     toggleMissedModeEl.textContent = missedMode ? 'Stop marking' : 'Mark misses';
   }
@@ -323,8 +653,8 @@
     missedLayer = L.geoJSON(currentMissedObjects, {
       pointToLayer: (_feature, latlng) => L.circleMarker(latlng, {
         radius: 6,
-        color: '#f59e0b',
-        fillColor: '#fbbf24',
+        color: '#b7791f',
+        fillColor: '#f5b642',
         fillOpacity: 0.9,
         weight: 2,
       }),
@@ -341,8 +671,10 @@
 
   async function refreshMissedObjects() {
     if (!currentJobId) return;
-    currentMissedObjects = await fetch(`/jobs/${currentJobId}/missed_objects`).then(r => r.json());
+    currentMissedObjects = await fetchJson(`/jobs/${currentJobId}/missed_objects`);
     renderMissedObjects();
+    currentJobSummary = await fetchJobSummary(currentJobId);
+    renderJobDetail(currentJobSummary);
     void renderComparison();
   }
 
@@ -371,34 +703,75 @@
 
   async function refreshJobs() {
     const res = await fetch('/jobs');
-    const jobs = await res.json();
-    latestJobs = jobs;
+    if (!res.ok) {
+      workerStatusEl.textContent = 'API unavailable';
+      return;
+    }
+    latestJobs = await res.json();
+    const active = latestJobs.find(job => ['PENDING', 'DOWNLOADING', 'INFERRING'].includes(job.status));
+    queueSummaryEl.textContent = active ? `${active.status.toLowerCase()}: ${jobName(active)}` : 'No active job';
+    workerStatusEl.textContent = latestJobs.length ? `${latestJobs.length} jobs` : 'No jobs yet';
     renderJobs();
   }
 
   function renderJobs() {
-    const jobs = latestJobs.filter(jobMatchesFilters);
+    const filteredJobs = latestJobs.filter(jobMatchesFilters);
+    const jobs = showAllJobs ? filteredJobs : filteredJobs.slice(0, 5);
     jobsEl.innerHTML = '';
-    jobCountEl.textContent = `${jobs.length}/${latestJobs.length}`;
+    jobCountEl.textContent = `${jobs.length}/${filteredJobs.length}`;
+    toggleAllJobsEl.hidden = filteredJobs.length <= 5;
+    toggleAllJobsEl.textContent = showAllJobs ? 'Show latest 5' : 'Show all jobs';
     for (const job of jobs) {
-      const el = document.createElement('div');
+      const done = (job.tile_completed || 0) + (job.tile_failed || 0);
+      const total = job.tile_total || '?';
+      const el = document.createElement('article');
       el.className = 'job';
       if (job.id === currentJobId) el.classList.add('active');
-      const done = (job.tile_completed || 0) + (job.tile_failed || 0);
+      if (job.status === 'FAILED') {
+        el.title = [job.error_reason, job.error_message].filter(Boolean).join('\n\n');
+      }
+
+      const top = document.createElement('div');
+      top.className = 'job-top';
       const titleWrap = document.createElement('div');
       const title = document.createElement('div');
       title.className = 'job-title';
       title.textContent = jobName(job);
       const meta = document.createElement('div');
-      meta.className = 'job-meta';
-      meta.textContent = `${job.status} ${done}/${job.tile_total || '?'} | ${shortId(job.id)}`;
+      meta.className = 'job-sub';
+      meta.textContent = `${shortId(job.id)} / ${job.tile_preset} / ${new Date(job.created_at).toLocaleString()}`;
       titleWrap.append(title, meta);
-      if (job.status === 'FAILED') {
-        el.title = [job.error_reason, job.error_message].filter(Boolean).join('\n\n');
-        meta.textContent = `FAILED${job.error_reason ? ` (${job.error_reason})` : ''} | ${shortId(job.id)}`;
-      }
+      const status = document.createElement('span');
+      status.className = `pill ${statusClass(job.status)}`;
+      status.textContent = job.status === 'FAILED' && job.error_reason ? job.error_reason : job.status;
+      top.append(titleWrap, status);
+
+      const grid = document.createElement('div');
+      grid.className = 'job-meta-grid';
+      grid.append(
+        metricCell(`${done}/${total}`, 'tiles'),
+        metricCell(String(job.tile_failed || 0), 'failed'),
+        metricCell(job.export_stale ? 'stale' : 'fresh', 'export'),
+      );
+
+      const progress = jobProgress(job);
+
       const actions = document.createElement('div');
       actions.className = 'job-actions';
+      const note = document.createElement('span');
+      note.className = 'hint';
+      note.textContent = job.status === 'READY_FOR_REVIEW'
+        ? 'Click detections to review.'
+        : (job.status === 'FAILED' ? 'Open for error detail.' : 'Progress updates automatically.');
+      const buttons = document.createElement('div');
+      buttons.className = 'mini-buttons';
+      const copy = document.createElement('button');
+      copy.type = 'button';
+      copy.textContent = 'Copy';
+      copy.onclick = (event) => {
+        event.stopPropagation();
+        void useJobSettings(job.id);
+      };
       const rename = document.createElement('button');
       rename.type = 'button';
       rename.textContent = 'Rename';
@@ -406,11 +779,113 @@
         event.stopPropagation();
         void renameJob(job);
       };
-      actions.append(rename);
-      el.append(titleWrap, actions);
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.textContent = 'Delete';
+      remove.onclick = (event) => {
+        event.stopPropagation();
+        void deleteJob(job);
+      };
+      buttons.append(copy, rename, remove);
+      actions.append(note, buttons);
+
+      el.append(top, grid, progress, actions);
       el.onclick = () => openJob(job.id);
       jobsEl.appendChild(el);
     }
+  }
+
+  function jobProgress(job) {
+    const done = (job.tile_completed || 0) + (job.tile_failed || 0);
+    const total = Number(job.tile_total || 0);
+    const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+    const wrap = document.createElement('div');
+    wrap.className = 'job-progress';
+    const head = document.createElement('div');
+    head.className = 'job-progress-head';
+    const label = document.createElement('span');
+    label.textContent = progressLabel(job.status);
+    const value = document.createElement('span');
+    value.textContent = total > 0 ? `${pct}%` : 'waiting';
+    const track = document.createElement('div');
+    track.className = 'job-progress-track';
+    const bar = document.createElement('span');
+    bar.style.setProperty('--value', `${pct}%`);
+    track.append(bar);
+    head.append(label, value);
+    wrap.append(head, track);
+    return wrap;
+  }
+
+  function progressLabel(status) {
+    if (status === 'PENDING') return 'queued';
+    if (status === 'DOWNLOADING') return 'downloading imagery';
+    if (status === 'INFERRING') return 'tile inference';
+    if (status === 'READY_FOR_REVIEW') return 'ready for review';
+    if (status === 'EXPORTED') return 'exported';
+    if (status === 'FAILED') return 'failed';
+    return 'job progress';
+  }
+
+  function metricCell(value, label) {
+    const span = document.createElement('span');
+    const b = document.createElement('b');
+    b.textContent = value;
+    span.append(b, document.createTextNode(label));
+    return span;
+  }
+
+  async function useJobSettings(jobId) {
+    const job = await fetchJson(`/jobs/${jobId}`);
+    if (!job) {
+      statusEl.textContent = 'Job settings could not be loaded';
+      return;
+    }
+    promptEl.value = job.prompt || '';
+    presetEl.value = job.tile_preset || 'medium';
+    renderPresetButtons();
+    applyModalityFilter(job.modality_filter || {});
+    applyVectorOptions(job.run_metadata?.vector_options);
+    if (Array.isArray(job.bbox_wgs84) && job.bbox_wgs84.length === 4) {
+      setDrawnBbox(job.bbox_wgs84, {fit: true});
+    }
+    statusEl.textContent = `Settings copied from ${jobName(job)}`;
+  }
+
+  function setNumberInput(id, value) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.value = value === null || value === undefined ? '' : String(value);
+  }
+
+  async function deleteJob(job) {
+    const name = jobName(job);
+    if (!window.confirm(`Delete job "${name}"? This removes the job, review state, and exported files.`)) {
+      return;
+    }
+    const res = await fetch(`/jobs/${job.id}`, {method: 'DELETE'});
+    if (!res.ok) {
+      statusEl.textContent = await res.text();
+      return;
+    }
+    if (currentJobId === job.id) {
+      currentJobId = null;
+      currentJobSummary = null;
+      currentPolygons = null;
+      currentMissedObjects = null;
+      if (polygonLayer) polygonLayer.remove();
+      if (nodataLayer) nodataLayer.remove();
+      if (missedLayer) missedLayer.remove();
+      renderJobDetail(null);
+      renderReviewStats();
+      renderMissedStats();
+      updateDiagnostic(null);
+    }
+    comparisonJobIds = comparisonJobIds.filter(id => id !== job.id);
+    saveComparisonJobIds();
+    statusEl.textContent = `Deleted ${name}`;
+    await refreshJobs();
+    void renderComparison();
   }
 
   async function renameJob(job) {
@@ -444,6 +919,8 @@
         if (pendingUpdates.get(pid) === sentVal) pendingUpdates.delete(pid);
       }
       pendingUpdates.size ? persistPending(jobId) : clearPending(jobId);
+      currentJobSummary = await fetchJobSummary(jobId);
+      renderJobDetail(currentJobSummary);
       void renderComparison();
     } catch (err) {
       failed = true;
@@ -514,20 +991,152 @@
     if (polygonLayer) polygonLayer.remove();
     if (nodataLayer) nodataLayer.remove();
     if (missedLayer) missedLayer.remove();
+
     const [polygons, nodata, missed, summary] = await Promise.all([
-      fetch(`/jobs/${jobId}/polygons`).then(r => r.json()),
-      fetch(`/jobs/${jobId}/nodata`).then(r => r.json()),
-      fetch(`/jobs/${jobId}/missed_objects`).then(r => r.json()),
+      fetchJson(`/jobs/${jobId}/polygons`),
+      fetchJson(`/jobs/${jobId}/nodata`),
+      fetchJson(`/jobs/${jobId}/missed_objects`),
       fetchJobSummary(jobId),
     ]);
+
     currentPolygons = polygons;
     currentMissedObjects = missed;
+    currentJobSummary = summary;
+    if (summary?.bbox_wgs84) {
+      setDrawnBbox(summary.bbox_wgs84);
+    }
+    renderJobDetail(summary);
     renderPolygons();
     renderMissedObjects();
-    nodataLayer = L.geoJSON(nodata, {
-      style: {color: '#111827', fillOpacity: 0.1, dashArray: '4 4'},
-    }).addTo(map);
+    updateDiagnostic(null);
+
+    if (nodata) {
+      nodataLayer = L.geoJSON(nodata, {
+        style: {color: '#172431', fillOpacity: 0.08, dashArray: '4 4', weight: 1},
+      }).addTo(map);
+    }
+    if (!fitToOpenJob(polygons, nodata, missed) && summary?.bbox_wgs84) {
+      setDrawnBbox(summary.bbox_wgs84, {fit: true});
+    }
+    statusEl.textContent = summary
+      ? `Opened ${jobName(summary)}`
+      : `Opened ${jobName({id: jobId})} without review data`;
+    renderJobs();
     void renderComparison();
+  }
+
+  function fitToOpenJob(...collections) {
+    const layers = [];
+    for (const collection of collections) {
+      if (!collection?.features?.length) continue;
+      layers.push(L.geoJSON(collection));
+    }
+    if (!layers.length) return false;
+    const group = L.featureGroup(layers);
+    const bounds = group.getBounds();
+    if (!bounds.isValid()) return false;
+    map.fitBounds(bounds.pad(0.12), {maxZoom: 19});
+    return true;
+  }
+
+  function renderJobDetail(summary) {
+    if (!summary) {
+      openReviewTitleEl.textContent = 'Open review';
+      openReviewStatusEl.textContent = 'no job';
+      openReviewStatusEl.className = 'pill';
+      detail.precision.textContent = 'n/a';
+      detail.recall.textContent = 'n/a';
+      detail.rejectedShare.textContent = 'n/a';
+      detail.lowScore.textContent = 'n/a';
+      detail.failedTiles.textContent = 'n/a';
+      detail.scoreRange.textContent = 'n/a';
+      detail.exportStale.textContent = 'n/a';
+      detail.prompt.textContent = 'n/a';
+      detail.bbox.textContent = 'n/a';
+      detail.preset.textContent = 'n/a';
+      detail.vector.textContent = 'n/a';
+      detail.modality.textContent = 'n/a';
+      detail.status.textContent = 'n/a';
+      detail.tiles.textContent = 'n/a';
+      detail.revision.textContent = 'n/a';
+      detail.created.textContent = 'n/a';
+      detail.runtime.textContent = 'n/a';
+      detail.model.textContent = 'n/a';
+      detail.preprocess.textContent = 'n/a';
+      detail.git.textContent = 'n/a';
+      exportStateEl.textContent = 'not exported';
+      exportStateEl.className = 'pill';
+      return;
+    }
+    const metadata = summary.run_metadata || {};
+    const settings = metadata.settings || {};
+    const vectorOptions = metadata.vector_options;
+    const rejectedShare = summary.total ? summary.rejected / summary.total : null;
+    const lowScore =
+      Number(summary.score_buckets?.lt_035 || 0) + Number(summary.score_buckets?.gte_035_lt_05 || 0);
+    const tileDone = Number(summary.tile_completed || 0) + Number(summary.tile_failed || 0);
+    const tileTotal = summary.tile_total ?? 'n/a';
+    openReviewTitleEl.textContent = summary.label || summary.prompt || 'Open review';
+    openReviewStatusEl.textContent = summary.status;
+    openReviewStatusEl.className = `pill ${statusClass(summary.status)}`;
+    detail.precision.textContent = formatPercent(summary.precision_review);
+    detail.recall.textContent = formatPercent(summary.recall_estimate);
+    detail.rejectedShare.textContent = formatPercent(rejectedShare);
+    detail.lowScore.textContent = `${lowScore} below 0.50`;
+    detail.failedTiles.textContent = String(summary.tile_failed || 0);
+    detail.scoreRange.textContent = `${formatScore(summary.min_score)} - ${formatScore(summary.max_score)} (avg ${formatScore(summary.avg_score)})`;
+    detail.prompt.textContent = summary.prompt || 'n/a';
+    detail.bbox.textContent = formatBbox(summary.bbox_wgs84);
+    detail.preset.textContent = summary.tile_preset || 'n/a';
+    detail.vector.textContent = formatVectorOptions(vectorOptions);
+    detail.modality.textContent = formatModality(summary.modality_filter || metadata.modality_filter);
+    detail.status.textContent = summary.status || 'n/a';
+    detail.tiles.textContent = `${tileDone}/${tileTotal}`;
+    detail.revision.textContent = String(summary.validation_revision ?? 'n/a');
+    detail.exportStale.textContent = summary.export_stale
+      ? `stale${summary.exported_revision !== null && summary.exported_revision !== undefined ? `, exported rev ${summary.exported_revision}` : ''}`
+      : 'fresh';
+    detail.created.textContent = formatDateTime(summary.created_at);
+    detail.runtime.textContent = formatRuntime(summary.started_at, summary.finished_at);
+    detail.model.textContent = settings.SAM3_MODEL_ID || 'n/a';
+    detail.preprocess.textContent = settings.SAM_IMAGE_PREPROCESS || 'n/a';
+    detail.git.textContent = metadata.git_commit_sha ? shortId(metadata.git_commit_sha) : 'n/a';
+    exportStateEl.textContent = summary.export_stale ? 'stale' : 'fresh';
+    exportStateEl.className = `pill ${summary.export_stale ? 'warn' : 'ready'}`;
+    if (summary.missed_marked !== undefined) kpiMissedEl.textContent = String(summary.missed_marked || 0);
+  }
+
+  function renderScoreHistogram() {
+    scoreHistogramEl.innerHTML = '';
+    const buckets = currentJobSummary?.score_buckets;
+    const rows = [
+      ['<0.35', buckets?.lt_035 || 0, true],
+      ['0.35-0.50', buckets?.gte_035_lt_05 || 0, true],
+      ['0.50-0.70', buckets?.gte_05_lt_07 || 0, false],
+      ['>=0.70', buckets?.gte_07 || 0, false],
+    ];
+    const max = Math.max(...rows.map(([, value]) => Number(value || 0)), 1);
+    rows.forEach(([labelText, value, low]) => {
+      const row = document.createElement('div');
+      row.className = `score-bucket${low ? ' low' : ''}`;
+      const label = document.createElement('span');
+      label.textContent = labelText;
+      const track = document.createElement('div');
+      track.className = 'score-bucket-track';
+      const bar = document.createElement('span');
+      bar.style.setProperty('--value', `${Math.max(3, (Number(value || 0) / max) * 100)}%`);
+      const count = document.createElement('b');
+      count.textContent = String(value || 0);
+      track.append(bar);
+      row.append(label, track, count);
+      scoreHistogramEl.appendChild(row);
+    });
+    thresholdTitleEl.textContent = currentJobSummary
+      ? `Precision proxy: ${formatPercent(currentJobSummary.precision_review)}`
+      : 'No review metrics yet';
+    thresholdCopyEl.textContent = currentJobSummary
+      ? `Recall estimate: ${formatPercent(currentJobSummary.recall_estimate)}. Buckets show model confidence before your visible score filter.`
+      : 'Open a job to inspect accepted and rejected score buckets.';
   }
 
   scoreFilterEl.addEventListener('input', renderPolygons);
@@ -536,6 +1145,11 @@
   jobSearchEl.addEventListener('input', renderJobs);
   showFailedJobsEl.addEventListener('change', renderJobs);
   showExportedJobsEl.addEventListener('change', renderJobs);
+  savePresetEl?.addEventListener('click', saveCurrentPreset);
+  toggleAllJobsEl.addEventListener('click', () => {
+    showAllJobs = !showAllJobs;
+    renderJobs();
+  });
   rejectBelowScoreEl.addEventListener('click', rejectAcceptedBelowScore);
   toggleMissedModeEl.addEventListener('click', () => {
     if (!currentJobId) {
@@ -556,6 +1170,17 @@
     }
     void renderComparison();
   });
+  copyMetadataEl?.addEventListener('click', async () => {
+    if (!currentJobId) {
+      statusEl.textContent = 'Open a job first';
+      return;
+    }
+    const job = await fetchJson(`/jobs/${currentJobId}`);
+    const payload = JSON.stringify(job?.run_metadata || {}, null, 2);
+    await navigator.clipboard?.writeText(payload);
+    statusEl.textContent = 'Run metadata copied';
+  });
+
   function readNumberInput(id) {
     const el = document.getElementById(id);
     if (!el || el.value === '') return null;
@@ -572,6 +1197,13 @@
     };
   }
 
+  function buildVectorOptions() {
+    return {
+      simplification_tolerance_m: readNumberInput('simplify-tolerance'),
+      orthogonalize: Boolean(orthogonalizeEl?.checked),
+    };
+  }
+
   submitEl.onclick = async () => {
     if (!bbox) {
       statusEl.textContent = 'Draw a rectangle first';
@@ -585,6 +1217,7 @@
         bbox_wgs84: bbox,
         tile_preset: presetEl.value,
         modality_filter: buildModalityFilter(),
+        vector_options: buildVectorOptions(),
       }),
     });
     if (!res.ok) {
@@ -593,16 +1226,21 @@
     }
     const job = await res.json();
     currentJobId = job.id;
-    statusEl.textContent = `Queued ${job.id}`;
+    statusEl.textContent = `Queued ${promptEl.value.trim() || 'job'}`;
     await refreshJobs();
   };
 
   exportEl.onclick = async () => {
-    if (!currentJobId) return;
+    if (!currentJobId) {
+      statusEl.textContent = 'Open a job first';
+      return;
+    }
     await flushValidations();
     const res = await fetch(`/jobs/${currentJobId}/export`, {method: 'POST'});
     statusEl.textContent = res.ok ? 'Exported' : 'Export failed';
     await refreshJobs();
+    currentJobSummary = await fetchJobSummary(currentJobId);
+    renderJobDetail(currentJobSummary);
   };
 
   window.addEventListener('pagehide', () => {
@@ -618,8 +1256,12 @@
     }).catch(() => {});
   });
 
+  renderPresetButtons();
+  renderReviewStats();
+  renderMissedStats();
+  renderJobDetail(null);
+  renderCustomPresets();
   setInterval(refreshJobs, 3000);
   void refreshJobs();
   void renderComparison();
-  renderMissedStats();
 })();

@@ -130,6 +130,8 @@ def filter_masks(
         if not mask.any():
             continue
 
+        mean_ndvi: float | None = None
+        mean_ndsm: float | None = None
         if thresholds.needs_nir() and ndvi is not None:
             mean_ndvi = _mean_over_mask(ndvi, mask)
             if not _value_in_range(mean_ndvi, thresholds.ndvi_min, thresholds.ndvi_max):
@@ -140,5 +142,13 @@ def filter_masks(
             if not _value_in_range(mean_ndsm, thresholds.ndsm_min, thresholds.ndsm_max):
                 continue
 
-        kept.append(mask_result)
+        kept.append(
+            MaskResult(
+                mask=mask_result.mask,
+                score=mask_result.score,
+                box_pixel=mask_result.box_pixel,
+                ndvi_mean=mean_ndvi,
+                ndsm_mean=mean_ndsm,
+            )
+        )
     return kept

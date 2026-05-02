@@ -242,6 +242,8 @@ def masks_to_polygons(
                     "score": float(mask_result.score),
                     "source_tile_row": tile.tile_row,
                     "source_tile_col": tile.tile_col,
+                    "ndvi_mean": mask_result.ndvi_mean,
+                    "ndsm_mean": mask_result.ndsm_mean,
                 }
             )
 

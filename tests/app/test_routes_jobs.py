@@ -188,6 +188,28 @@ def test_patch_job_label_updates_list_detail_and_summary(client):
     assert cleared.json()["label"] is None
 
 
+def test_delete_job_removes_job_and_blocks_running(client):
+    test_client, app = client
+    job_id = _make_reviewable_job(test_client, app)
+
+    deleted = test_client.delete(f"/jobs/{job_id}")
+
+    assert deleted.status_code == 200
+    assert deleted.json() == {"deleted": True}
+    assert test_client.get(f"/jobs/{job_id}").status_code == 404
+
+    running_id = test_client.post(
+        "/jobs",
+        json={"prompt": "building", "bbox_wgs84": _munich_bbox()},
+    ).json()["id"]
+    update_status(app.state.db_path, running_id, JobStatus.INFERRING)
+
+    blocked = test_client.delete(f"/jobs/{running_id}")
+
+    assert blocked.status_code == 409
+    assert get_job(app.state.db_path, running_id) is not None
+
+
 def test_job_summary_and_missed_estimate_endpoints(client):
     test_client, app = client
     job_id = _make_reviewable_job(test_client, app, n_polys=3)

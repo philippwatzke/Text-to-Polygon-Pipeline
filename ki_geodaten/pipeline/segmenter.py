@@ -13,6 +13,8 @@ class MaskResult:
     mask: np.ndarray
     score: float
     box_pixel: tuple[int, int, int, int]
+    ndvi_mean: float | None = None
+    ndsm_mean: float | None = None
 
 
 class SegmenterUnavailableError(RuntimeError):

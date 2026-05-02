@@ -47,6 +47,8 @@ CREATE TABLE IF NOT EXISTS polygons (
     score            REAL NOT NULL,
     source_tile_row  INTEGER NOT NULL,
     source_tile_col  INTEGER NOT NULL,
+    ndvi_mean        REAL,
+    ndsm_mean        REAL,
     validation       TEXT NOT NULL DEFAULT 'ACCEPTED' CHECK (validation IN ('ACCEPTED','REJECTED'))
 );
 CREATE INDEX IF NOT EXISTS idx_polygons_job ON polygons(job_id);
@@ -103,6 +105,14 @@ def init_schema(db_path: Path) -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN modality_filter TEXT")
         if "label" not in cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN label TEXT")
+        polygon_cols = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(polygons)").fetchall()
+        }
+        if "ndvi_mean" not in polygon_cols:
+            conn.execute("ALTER TABLE polygons ADD COLUMN ndvi_mean REAL")
+        if "ndsm_mean" not in polygon_cols:
+            conn.execute("ALTER TABLE polygons ADD COLUMN ndsm_mean REAL")
 
 def _utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -172,10 +182,12 @@ def insert_polygons(db_path: Path, job_id: str, polys: list[dict]) -> None:
     with connect(db_path) as conn:
         conn.execute("BEGIN")
         conn.executemany(
-            "INSERT INTO polygons(job_id,geometry_wkb,score,source_tile_row,source_tile_col)"
-            " VALUES (?,?,?,?,?)",
+            "INSERT INTO polygons(job_id,geometry_wkb,score,source_tile_row,source_tile_col,"
+            "ndvi_mean,ndsm_mean)"
+            " VALUES (?,?,?,?,?,?,?)",
             [(job_id, p["geometry_wkb"], p["score"],
-              p["source_tile_row"], p["source_tile_col"]) for p in polys],
+              p["source_tile_row"], p["source_tile_col"],
+              p.get("ndvi_mean"), p.get("ndsm_mean")) for p in polys],
         )
         conn.execute("COMMIT")
 
@@ -207,7 +219,8 @@ def increment_tile_failed(db_path: Path, job_id: str) -> None:
 def get_polygons_for_job(db_path: Path, job_id: str) -> list[dict]:
     with connect(db_path) as conn:
         rows = conn.execute(
-            "SELECT id,geometry_wkb,score,source_tile_row,source_tile_col,validation"
+            "SELECT id,geometry_wkb,score,source_tile_row,source_tile_col,"
+            "ndvi_mean,ndsm_mean,validation"
             " FROM polygons WHERE job_id = ?",
             (job_id,),
         ).fetchall()
@@ -219,12 +232,19 @@ def replace_polygons_for_job(db_path: Path, job_id: str, polys: list[dict]) -> N
         conn.execute("DELETE FROM polygons WHERE job_id = ?", (job_id,))
         if polys:
             conn.executemany(
-                "INSERT INTO polygons(job_id,geometry_wkb,score,source_tile_row,source_tile_col)"
-                " VALUES (?,?,?,?,?)",
+                "INSERT INTO polygons(job_id,geometry_wkb,score,source_tile_row,source_tile_col,"
+                "ndvi_mean,ndsm_mean)"
+                " VALUES (?,?,?,?,?,?,?)",
                 [(job_id, p["geometry_wkb"], p["score"],
-                  p["source_tile_row"], p["source_tile_col"]) for p in polys],
+                  p["source_tile_row"], p["source_tile_col"],
+                  p.get("ndvi_mean"), p.get("ndsm_mean")) for p in polys],
             )
         conn.execute("COMMIT")
+
+def delete_job(db_path: Path, job_id: str) -> bool:
+    with connect(db_path) as conn:
+        cursor = conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
+        return bool(cursor.rowcount)
 
 def get_nodata_for_job(db_path: Path, job_id: str) -> list[dict]:
     with connect(db_path) as conn:
@@ -371,6 +391,13 @@ def get_job_summary(db_path: Path, job_id: str) -> dict | None:
         "export_stale": job["exported_revision"] is None
         or job["exported_revision"] < job["validation_revision"],
         "created_at": job["created_at"],
+        "started_at": job["started_at"],
+        "finished_at": job["finished_at"],
+        "bbox_wgs84": json.loads(job["bbox_wgs84"]),
+        "run_metadata": json.loads(job["run_metadata"]) if job["run_metadata"] else None,
+        "modality_filter": json.loads(job["modality_filter"]) if job["modality_filter"] else None,
+        "error_reason": job["error_reason"],
+        "error_message": job["error_message"],
         "missed_estimate": job["missed_estimate"],
         "missed_marked": int(missed_marked or 0),
         "missed_for_recall": missed if missed_source is not None else None,
