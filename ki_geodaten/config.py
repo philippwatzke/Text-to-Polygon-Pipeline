@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     MAX_JOBS_PER_WORKER: int = 50
     MAX_WORKER_RUNTIME_SECONDS: int = 24 * 3600  # Spec §10: wall-clock restart
     WORKER_POLL_INTERVAL_SEC: float = 2.0
+    WORKER_HEARTBEAT_INTERVAL_SEC: float = 5.0
+    WORKER_STALE_AFTER_SEC: float = 20.0
 
     # API limits
     MAX_BBOX_AREA_KM2: float = 1.0

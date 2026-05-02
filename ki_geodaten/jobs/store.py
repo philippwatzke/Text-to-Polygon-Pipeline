@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+from ki_geodaten.jobs.json_utils import dumps_or_none, loads_json, vector_options_payload
 from ki_geodaten.models import JobStatus, TilePreset
 
 SCHEMA = """
@@ -34,6 +35,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     missed_estimate   INTEGER,
     run_metadata      TEXT,
     modality_filter   TEXT,
+    vector_options    TEXT,
     created_at        TEXT NOT NULL,
     started_at        TEXT,
     finished_at       TEXT
@@ -71,6 +73,19 @@ CREATE TABLE IF NOT EXISTS missed_objects (
     created_at       TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_missed_objects_job ON missed_objects(job_id);
+
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+    worker_id        TEXT PRIMARY KEY,
+    pid              INTEGER NOT NULL,
+    hostname         TEXT NOT NULL,
+    started_at       TEXT NOT NULL,
+    last_seen_at     TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    current_job_id   TEXT,
+    processed_jobs   INTEGER NOT NULL DEFAULT 0,
+    last_error       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_worker_heartbeats_last_seen ON worker_heartbeats(last_seen_at);
 """
 
 def _apply_pragmas(conn: sqlite3.Connection) -> None:
@@ -103,6 +118,8 @@ def init_schema(db_path: Path) -> None:
             conn.execute("ALTER TABLE jobs ADD COLUMN run_metadata TEXT")
         if "modality_filter" not in cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN modality_filter TEXT")
+        if "vector_options" not in cols:
+            conn.execute("ALTER TABLE jobs ADD COLUMN vector_options TEXT")
         if "label" not in cols:
             conn.execute("ALTER TABLE jobs ADD COLUMN label TEXT")
         polygon_cols = {
@@ -123,12 +140,13 @@ def insert_job(
     tile_preset: TilePreset,
     run_metadata: dict | None = None,
     modality_filter: dict | None = None,
+    vector_options: dict | None = None,
 ) -> None:
     with connect(db_path) as conn:
         conn.execute(
             "INSERT INTO jobs(id,prompt,bbox_wgs84,bbox_utm_snapped,tile_preset,"
-            "status,run_metadata,modality_filter,created_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            "status,run_metadata,modality_filter,vector_options,created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (
                 job_id,
                 prompt,
@@ -136,8 +154,9 @@ def insert_job(
                 json.dumps(bbox_utm_snapped),
                 str(tile_preset),
                 JobStatus.PENDING,
-                json.dumps(run_metadata) if run_metadata is not None else None,
-                json.dumps(modality_filter) if modality_filter is not None else None,
+                dumps_or_none(run_metadata),
+                dumps_or_none(modality_filter),
+                dumps_or_none(vector_options),
                 _utc_iso(),
             ),
         )
@@ -394,8 +413,9 @@ def get_job_summary(db_path: Path, job_id: str) -> dict | None:
         "started_at": job["started_at"],
         "finished_at": job["finished_at"],
         "bbox_wgs84": json.loads(job["bbox_wgs84"]),
-        "run_metadata": json.loads(job["run_metadata"]) if job["run_metadata"] else None,
-        "modality_filter": json.loads(job["modality_filter"]) if job["modality_filter"] else None,
+        "run_metadata": loads_json(job["run_metadata"]),
+        "modality_filter": loads_json(job["modality_filter"]),
+        "vector_options": vector_options_payload(job),
         "error_reason": job["error_reason"],
         "error_message": job["error_message"],
         "missed_estimate": job["missed_estimate"],
@@ -457,3 +477,74 @@ def abort_incomplete_jobs_on_startup(db_path: Path) -> list[str]:
         )
         conn.execute("COMMIT")
     return ids
+
+def upsert_worker_heartbeat(
+    db_path: Path,
+    *,
+    worker_id: str,
+    pid: int,
+    hostname: str,
+    started_at: str,
+    state: str,
+    current_job_id: str | None = None,
+    processed_jobs: int = 0,
+    last_error: str | None = None,
+) -> None:
+    now = _utc_iso()
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO worker_heartbeats(
+                worker_id,pid,hostname,started_at,last_seen_at,state,
+                current_job_id,processed_jobs,last_error
+            )
+            VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(worker_id) DO UPDATE SET
+                pid=excluded.pid,
+                hostname=excluded.hostname,
+                started_at=excluded.started_at,
+                last_seen_at=excluded.last_seen_at,
+                state=excluded.state,
+                current_job_id=excluded.current_job_id,
+                processed_jobs=excluded.processed_jobs,
+                last_error=excluded.last_error
+            """,
+            (
+                worker_id,
+                pid,
+                hostname,
+                started_at,
+                now,
+                state,
+                current_job_id,
+                processed_jobs,
+                last_error,
+            ),
+        )
+
+
+def get_latest_worker_heartbeat(db_path: Path) -> dict | None:
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM worker_heartbeats ORDER BY last_seen_at DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def get_queue_counts(db_path: Path) -> dict:
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT status, COUNT(*) AS total
+            FROM jobs
+            GROUP BY status
+            """
+        ).fetchall()
+    by_status = {row["status"]: int(row["total"]) for row in rows}
+    return {
+        "pending": by_status.get("PENDING", 0),
+        "running": by_status.get("DOWNLOADING", 0) + by_status.get("INFERRING", 0),
+        "failed": by_status.get("FAILED", 0),
+        "ready_for_review": by_status.get("READY_FOR_REVIEW", 0),
+        "exported": by_status.get("EXPORTED", 0),
+    }

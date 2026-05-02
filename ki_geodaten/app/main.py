@@ -130,9 +130,11 @@ def create_app(
 
     from ki_geodaten.app.routes.geojson import router as geojson_router
     from ki_geodaten.app.routes.jobs import router as jobs_router
+    from ki_geodaten.app.routes.system import router as system_router
 
     app.include_router(jobs_router)
     app.include_router(geojson_router)
+    app.include_router(system_router)
     return app
 
 

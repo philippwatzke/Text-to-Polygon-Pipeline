@@ -708,10 +708,37 @@
       return;
     }
     latestJobs = await res.json();
-    const active = latestJobs.find(job => ['PENDING', 'DOWNLOADING', 'INFERRING'].includes(job.status));
-    queueSummaryEl.textContent = active ? `${active.status.toLowerCase()}: ${jobName(active)}` : 'No active job';
-    workerStatusEl.textContent = latestJobs.length ? `${latestJobs.length} jobs` : 'No jobs yet';
     renderJobs();
+  }
+
+  async function refreshHealth() {
+    const res = await fetch('/system/health');
+    if (!res.ok) {
+      workerStatusEl.textContent = 'health unavailable';
+      return;
+    }
+    const health = await res.json();
+    const worker = health.worker || {};
+    const queue = health.queue || {};
+    const activeJob = latestJobs.find(job => job.id === worker.current_job_id);
+    const workerLabel = worker.state === 'online'
+      ? `${worker.heartbeat_state || 'worker'}${activeJob ? `: ${jobName(activeJob)}` : ''}`
+      : worker.state;
+    workerStatusEl.textContent = workerLabel || 'offline';
+
+    const pending = Number(queue.pending || 0);
+    const running = Number(queue.running || 0);
+    const ready = Number(queue.ready_for_review || 0);
+    const failed = Number(queue.failed || 0);
+    if (running > 0 && activeJob) {
+      queueSummaryEl.textContent = `running: ${jobName(activeJob)}`;
+    } else if (pending > 0 || running > 0) {
+      queueSummaryEl.textContent = `${running} running / ${pending} queued`;
+    } else if (ready > 0 || failed > 0) {
+      queueSummaryEl.textContent = `${ready} ready / ${failed} failed`;
+    } else {
+      queueSummaryEl.textContent = 'No active job';
+    }
   }
 
   function renderJobs() {
@@ -845,7 +872,7 @@
     presetEl.value = job.tile_preset || 'medium';
     renderPresetButtons();
     applyModalityFilter(job.modality_filter || {});
-    applyVectorOptions(job.run_metadata?.vector_options);
+    applyVectorOptions(job.vector_options || job.run_metadata?.vector_options);
     if (Array.isArray(job.bbox_wgs84) && job.bbox_wgs84.length === 4) {
       setDrawnBbox(job.bbox_wgs84, {fit: true});
     }
@@ -1070,7 +1097,7 @@
     }
     const metadata = summary.run_metadata || {};
     const settings = metadata.settings || {};
-    const vectorOptions = metadata.vector_options;
+    const vectorOptions = summary.vector_options || metadata.vector_options;
     const rejectedShare = summary.total ? summary.rejected / summary.total : null;
     const lowScore =
       Number(summary.score_buckets?.lt_035 || 0) + Number(summary.score_buckets?.gte_035_lt_05 || 0);
@@ -1261,7 +1288,10 @@
   renderMissedStats();
   renderJobDetail(null);
   renderCustomPresets();
-  setInterval(refreshJobs, 3000);
-  void refreshJobs();
+  setInterval(() => {
+    void refreshJobs();
+    void refreshHealth();
+  }, 3000);
+  void refreshJobs().then(() => refreshHealth());
   void renderComparison();
 })();

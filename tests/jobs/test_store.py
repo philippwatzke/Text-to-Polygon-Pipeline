@@ -5,11 +5,14 @@ from ki_geodaten.jobs.store import (
     connect,
     get_job,
     get_job_summary,
+    get_latest_worker_heartbeat,
+    get_queue_counts,
     init_schema,
     insert_job,
     update_job_label,
     update_missed_estimate,
     update_status,
+    upsert_worker_heartbeat,
 )
 from ki_geodaten.models import JobStatus, TilePreset
 
@@ -49,6 +52,7 @@ def test_init_schema_adds_missed_estimate_to_existing_jobs_table(tmp_path: Path)
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)").fetchall()}
     assert "missed_estimate" in cols
     assert "label" in cols
+    assert "vector_options" in cols
 
 def test_connect_sets_wal_mode(tmp_path):
     db = tmp_path / "t.db"
@@ -75,6 +79,23 @@ def test_insert_and_get_job(tmp_path):
     assert job["label"] is None
     assert job["validation_revision"] == 0
     assert job["exported_revision"] is None
+    assert job["vector_options"] is None
+
+def test_insert_job_persists_vector_options(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    insert_job(
+        db,
+        job_id="j1",
+        prompt="building",
+        bbox_wgs84=[0, 0, 1, 1],
+        bbox_utm_snapped=[0, 0, 1, 1],
+        tile_preset=TilePreset.MEDIUM,
+        vector_options={"simplification_tolerance_m": 0.3, "orthogonalize": True},
+    )
+
+    job = get_job(db, "j1")
+    assert '"orthogonalize": true' in job["vector_options"]
 
 def test_update_job_label(tmp_path):
     db = tmp_path / "t.db"
@@ -187,6 +208,31 @@ def test_job_summary_returns_review_metrics_and_score_buckets(tmp_path):
         "gte_07": 1,
     }
 
+def test_job_summary_returns_vector_options_with_metadata_fallback(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    insert_job(
+        db,
+        job_id="j1",
+        prompt="car",
+        bbox_wgs84=[0, 0, 1, 1],
+        bbox_utm_snapped=[0, 0, 1, 1],
+        tile_preset=TilePreset.SMALL,
+        run_metadata={
+            "vector_options": {
+                "simplification_tolerance_m": 0.4,
+                "orthogonalize": False,
+            }
+        },
+    )
+
+    summary = get_job_summary(db, "j1")
+
+    assert summary["vector_options"] == {
+        "simplification_tolerance_m": 0.4,
+        "orthogonalize": False,
+    }
+
 def test_validate_bulk_handles_many_updates(tmp_path):
     db = tmp_path / "t.db"
     init_schema(db)
@@ -224,3 +270,32 @@ def test_insert_nodata_region(tmp_path):
     rows = get_nodata_for_job(db, jid)
     assert len(rows) == 1
     assert rows[0]["reason"] == "OOM"
+
+
+def test_worker_heartbeat_upsert_and_queue_counts(tmp_path):
+    db = tmp_path / "t.db"
+    init_schema(db)
+    insert_job(db, job_id="pending", prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    insert_job(db, job_id="running", prompt="p", bbox_wgs84=[0,0,1,1],
+               bbox_utm_snapped=[0,0,1,1], tile_preset=TilePreset.MEDIUM)
+    update_status(db, "running", JobStatus.INFERRING)
+    upsert_worker_heartbeat(
+        db,
+        worker_id="w1",
+        pid=123,
+        hostname="host",
+        started_at="2026-05-02T00:00:00+00:00",
+        state="running",
+        current_job_id="running",
+        processed_jobs=7,
+    )
+
+    heartbeat = get_latest_worker_heartbeat(db)
+    counts = get_queue_counts(db)
+
+    assert heartbeat["worker_id"] == "w1"
+    assert heartbeat["current_job_id"] == "running"
+    assert heartbeat["processed_jobs"] == 7
+    assert counts["pending"] == 1
+    assert counts["running"] == 1

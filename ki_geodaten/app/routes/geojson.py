@@ -17,6 +17,7 @@ from ki_geodaten.jobs.store import (
     get_nodata_for_job,
     get_polygons_for_job,
 )
+from ki_geodaten.models import REVIEWABLE_JOB_STATUSES
 from ki_geodaten.pipeline.geo_utils import transform_bbox_wgs84_to_utm
 
 router = APIRouter()
@@ -39,7 +40,7 @@ async def _build_geojson(request: Request, job_id: str, target: str) -> Response
     job = get_job(request.app.state.db_path, job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    if job["status"] not in {"READY_FOR_REVIEW", "EXPORTED"}:
+    if job["status"] not in REVIEWABLE_JOB_STATUSES:
         raise HTTPException(409, "job not ready")
 
     revision = job["validation_revision"] if target in {"polygons", "missed_objects"} else 0

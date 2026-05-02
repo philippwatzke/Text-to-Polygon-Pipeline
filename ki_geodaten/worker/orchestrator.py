@@ -11,6 +11,7 @@ import rasterio
 from shapely.wkb import dumps as wkb_dumps
 from shapely.wkb import loads as wkb_loads
 
+from ki_geodaten.jobs.json_utils import loads_json_object, vector_options_model
 from ki_geodaten.jobs.store import (
     get_job,
     get_polygons_for_job,
@@ -39,6 +40,7 @@ from ki_geodaten.pipeline.tiler import (
     iter_tiles,
     safe_center_polygon,
 )
+from ki_geodaten.pipeline.vector_cleanup import apply_vector_cleanup
 
 logger = logging.getLogger(__name__)
 
@@ -184,12 +186,8 @@ def _download_error_reason(exc: DopDownloadError) -> str:
 
 def _load_modality_thresholds(job: dict) -> ModalityThresholds:
     """Inputs: dict. Logic: parse the job modality filter JSON into threshold bounds. Returns: ModalityThresholds."""
-    raw = job.get("modality_filter")
-    if not raw:
-        return ModalityThresholds()
-    try:
-        payload = json.loads(raw)
-    except (TypeError, ValueError):
+    payload = loads_json_object(job.get("modality_filter"))
+    if payload is None:
         return ModalityThresholds()
     return ModalityThresholds(
         ndvi_min=payload.get("ndvi_min"),
@@ -282,6 +280,7 @@ def run_job(
         update_status(db_path, job_id, JobStatus.INFERRING, tile_total=tile_total)
 
         thresholds = _load_modality_thresholds(job)
+        vector_options = vector_options_model(job)
         ndsm_path: Path | None = None
         if (
             thresholds.needs_ndsm()
@@ -367,6 +366,7 @@ def run_job(
                         thresholds=thresholds,
                     )
                 gdf = masks_to_polygons(kept, tile, min_area_m2=min_polygon_area_m2)
+                gdf = apply_vector_cleanup(gdf, vector_options)
                 _persist_polygons_for_tile(db_path, job_id, gdf)
                 increment_tile_completed(db_path, job_id)
             except Exception as exc:  # noqa: BLE001

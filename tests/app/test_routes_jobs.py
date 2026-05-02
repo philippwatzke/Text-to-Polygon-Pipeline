@@ -39,7 +39,17 @@ def test_post_jobs_accepts_valid_and_defaults_medium(client):
 
 def test_post_jobs_persists_run_metadata_snapshot(client):
     test_client, app = client
-    response = test_client.post("/jobs", json={"prompt": "building", "bbox_wgs84": _munich_bbox()})
+    response = test_client.post(
+        "/jobs",
+        json={
+            "prompt": "building",
+            "bbox_wgs84": _munich_bbox(),
+            "vector_options": {
+                "simplification_tolerance_m": 0.3,
+                "orthogonalize": True,
+            },
+        },
+    )
     assert response.status_code == 200
     job_id = response.json()["id"]
 
@@ -53,6 +63,11 @@ def test_post_jobs_persists_run_metadata_snapshot(client):
     assert metadata["settings"]["WCS_URL"] == app.state.settings.WCS_URL
     assert "git_commit_sha" in metadata
     assert "package_version" in metadata
+    assert detail["vector_options"] == {
+        "simplification_tolerance_m": 0.3,
+        "orthogonalize": True,
+    }
+    assert get_job(app.state.db_path, job_id)["vector_options"] is not None
 
 
 def test_post_jobs_rejects_outside_bayern(client):

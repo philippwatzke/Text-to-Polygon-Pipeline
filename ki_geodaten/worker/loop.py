@@ -7,12 +7,19 @@ import os
 import shutil
 import ctypes
 import time
+import socket
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from ki_geodaten.jobs.retention import cleanup_old_jobs
-from ki_geodaten.jobs.store import abort_incomplete_jobs_on_startup, claim_next_pending_job, connect
+from ki_geodaten.jobs.store import (
+    abort_incomplete_jobs_on_startup,
+    claim_next_pending_job,
+    connect,
+)
+from ki_geodaten.worker.health import WorkerHealthReporter
 from ki_geodaten.worker.orchestrator import run_job
 
 logger = logging.getLogger(__name__)
@@ -168,6 +175,8 @@ def run_forever(
     global_polygon_fragment_coverage_ratio: float = 0.65,
     global_polygon_fragment_max_area_ratio: float = 0.75,
     global_polygon_fragment_buffer_m: float = 1.0,
+    heartbeat_interval: float = 5.0,
+    worker_id: str | None = None,
 ) -> None:
     startup_cleanup(
         db_path,
@@ -175,65 +184,87 @@ def run_forever(
         results_dir=results_dir,
         retention_days=retention_days,
     )
-    segmenter = segmenter_factory()
-    processed = 0
-    idle_polls = 0
-    deadline = math.inf if max_runtime_seconds is None else clock() + max_runtime_seconds
-
-    while processed < max_jobs:
-        if clock() >= deadline:
-            logger.info("worker reached wall-clock budget; exiting for supervisor restart")
-            return
-
-        job = claim_next_pending_job(db_path)
-        if job is None:
-            idle_polls += 1
-            if idle_exit_after is not None and idle_polls >= idle_exit_after:
-                return
-            time.sleep(poll_interval)
-            continue
-
+    reporter = WorkerHealthReporter(
+        db_path=db_path,
+        worker_id=worker_id or f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4()}",
+        interval=heartbeat_interval,
+    )
+    reporter.start()
+    try:
+        segmenter = segmenter_factory()
+        reporter.set_state("idle")
+        processed = 0
         idle_polls = 0
-        try:
-            run_job(
-                db_path,
-                job_id=job["id"],
-                segmenter=segmenter,
-                data_root=data_root,
-                wcs_url=wcs_url,
-                coverage_id=coverage_id,
-                max_pixels=max_pixels,
-                dop_download_workers=dop_download_workers,
-                wcs_version=wcs_version,
-                fmt=fmt,
-                crs=crs,
-                origin_x=origin_x,
-                origin_y=origin_y,
-                min_polygon_area_m2=min_polygon_area_m2,
-                safe_center_nodata_threshold=safe_center_nodata_threshold,
-                wcs_username=wcs_username,
-                wcs_password=wcs_password,
-                fill_wcs_rgb_zero_with_wms=fill_wcs_rgb_zero_with_wms,
-                wms_url=wms_url,
-                wms_layer=wms_layer,
-                wms_version=wms_version,
-                wms_format=wms_format,
-                dop_source=dop_source,
-                dgm_metalink_url=dgm_metalink_url,
-                dgm_tile_cache_dir=dgm_tile_cache_dir,
-                dgm_native_step_m=dgm_native_step_m,
-                dom_metalink_url=dom_metalink_url,
-                dom_tile_cache_dir=dom_tile_cache_dir,
-                dom_native_step_m=dom_native_step_m,
-                global_polygon_nms_iou=global_polygon_nms_iou,
-                global_polygon_containment_ratio=global_polygon_containment_ratio,
-                global_polygon_fragment_coverage_ratio=global_polygon_fragment_coverage_ratio,
-                global_polygon_fragment_max_area_ratio=global_polygon_fragment_max_area_ratio,
-                global_polygon_fragment_buffer_m=global_polygon_fragment_buffer_m,
-            )
-        except Exception:
-            logger.exception("job crashed outside orchestrator try/except: %s", job["id"])
-        processed += 1
+        deadline = math.inf if max_runtime_seconds is None else clock() + max_runtime_seconds
+        run_job_kwargs = {
+            "data_root": data_root,
+            "wcs_url": wcs_url,
+            "coverage_id": coverage_id,
+            "max_pixels": max_pixels,
+            "dop_download_workers": dop_download_workers,
+            "wcs_version": wcs_version,
+            "fmt": fmt,
+            "crs": crs,
+            "origin_x": origin_x,
+            "origin_y": origin_y,
+            "min_polygon_area_m2": min_polygon_area_m2,
+            "safe_center_nodata_threshold": safe_center_nodata_threshold,
+            "wcs_username": wcs_username,
+            "wcs_password": wcs_password,
+            "fill_wcs_rgb_zero_with_wms": fill_wcs_rgb_zero_with_wms,
+            "wms_url": wms_url,
+            "wms_layer": wms_layer,
+            "wms_version": wms_version,
+            "wms_format": wms_format,
+            "dop_source": dop_source,
+            "dgm_metalink_url": dgm_metalink_url,
+            "dgm_tile_cache_dir": dgm_tile_cache_dir,
+            "dgm_native_step_m": dgm_native_step_m,
+            "dom_metalink_url": dom_metalink_url,
+            "dom_tile_cache_dir": dom_tile_cache_dir,
+            "dom_native_step_m": dom_native_step_m,
+            "global_polygon_nms_iou": global_polygon_nms_iou,
+            "global_polygon_containment_ratio": global_polygon_containment_ratio,
+            "global_polygon_fragment_coverage_ratio": global_polygon_fragment_coverage_ratio,
+            "global_polygon_fragment_max_area_ratio": global_polygon_fragment_max_area_ratio,
+            "global_polygon_fragment_buffer_m": global_polygon_fragment_buffer_m,
+        }
+
+        while processed < max_jobs:
+            if clock() >= deadline:
+                logger.info("worker reached wall-clock budget; exiting for supervisor restart")
+                return
+
+            job = claim_next_pending_job(db_path)
+            if job is None:
+                idle_polls += 1
+                reporter.set_state("idle", current_job_id=None)
+                if idle_exit_after is not None and idle_polls >= idle_exit_after:
+                    return
+                time.sleep(poll_interval)
+                continue
+
+            idle_polls = 0
+            reporter.set_state("running", current_job_id=job["id"])
+            try:
+                run_job(
+                    db_path,
+                    job_id=job["id"],
+                    segmenter=segmenter,
+                    **run_job_kwargs,
+                )
+                reporter.set_state("idle", current_job_id=None)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("job crashed outside orchestrator try/except: %s", job["id"])
+                reporter.set_state(
+                    "idle",
+                    current_job_id=None,
+                    last_error=f"{type(exc).__name__}: {exc}",
+                )
+            processed += 1
+            reporter.mark_processed()
+    finally:
+        reporter.stop()
 
 
 def main() -> None:  # pragma: no cover
@@ -301,6 +332,7 @@ def _run_main(settings, segmenter_cls) -> None:
         global_polygon_fragment_coverage_ratio=settings.GLOBAL_POLYGON_FRAGMENT_COVERAGE_RATIO,
         global_polygon_fragment_max_area_ratio=settings.GLOBAL_POLYGON_FRAGMENT_MAX_AREA_RATIO,
         global_polygon_fragment_buffer_m=settings.GLOBAL_POLYGON_FRAGMENT_BUFFER_M,
+        heartbeat_interval=settings.WORKER_HEARTBEAT_INTERVAL_SEC,
     )
 
 

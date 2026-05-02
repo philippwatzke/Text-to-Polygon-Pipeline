@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import uuid
 from pathlib import Path
@@ -9,10 +10,11 @@ import geopandas as gpd
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from shapely.geometry import Point, box
-from shapely.wkb import loads as wkb_loads
 from shapely.wkb import dumps as wkb_dumps
+from shapely.wkb import loads as wkb_loads
 
 from ki_geodaten.config import Settings
+from ki_geodaten.jobs.json_utils import loads_json, vector_options_payload
 from ki_geodaten.jobs.store import (
     get_job,
     get_job_summary,
@@ -33,18 +35,18 @@ from ki_geodaten.models import (
     CreateJobRequest,
     JobLabelRequest,
     JobStatus,
-    MissedObjectRequest,
     MissedEstimateRequest,
+    MissedObjectRequest,
+    REVIEWABLE_JOB_STATUSES,
+    RUNNING_JOB_STATUSES,
     ValidateBulkRequest,
 )
-import logging
-
-logger = logging.getLogger(__name__)
 from ki_geodaten.app.run_metadata import build_run_metadata
 from ki_geodaten.pipeline.dop_client import prepare_download_bbox
 from ki_geodaten.pipeline.exporter import export_two_layer_gpkg
 from ki_geodaten.pipeline.geo_utils import transform_bbox_wgs84_to_utm, transformer_4326_to_25832
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -79,20 +81,14 @@ def _job_view(job: dict) -> dict:
         "bbox_wgs84",
         "run_metadata",
         "modality_filter",
+        "vector_options",
     )
     view = {field: job.get(field) for field in fields}
     if view.get("bbox_wgs84"):
         view["bbox_wgs84"] = json.loads(view["bbox_wgs84"])
-    if view.get("run_metadata"):
-        try:
-            view["run_metadata"] = json.loads(view["run_metadata"])
-        except (TypeError, ValueError):
-            view["run_metadata"] = None
-    if view.get("modality_filter"):
-        try:
-            view["modality_filter"] = json.loads(view["modality_filter"])
-        except (TypeError, ValueError):
-            view["modality_filter"] = None
+    view["run_metadata"] = loads_json(view.get("run_metadata"))
+    view["modality_filter"] = loads_json(view.get("modality_filter"))
+    view["vector_options"] = vector_options_payload(job)
     exported = job.get("exported_revision")
     validation = job.get("validation_revision") or 0
     view["export_stale"] = exported is None or exported < validation
@@ -162,6 +158,7 @@ async def create_job(req: CreateJobRequest, request: Request):
         tile_preset=req.tile_preset,
         run_metadata=run_metadata,
         modality_filter=modality_filter_dict if req.modality_filter.is_active() else None,
+        vector_options=vector_options_dict,
     )
     return {"id": job_id, "status": "PENDING"}
 
@@ -184,7 +181,7 @@ def delete_job_endpoint(job_id: str, request: Request):
     job = get_job(request.app.state.db_path, job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    if job["status"] in {"DOWNLOADING", "INFERRING"}:
+    if job["status"] in RUNNING_JOB_STATUSES:
         raise HTTPException(409, "running jobs cannot be deleted")
 
     deleted = delete_job(request.app.state.db_path, job_id)
@@ -241,7 +238,7 @@ def create_missed_object(job_id: str, req: MissedObjectRequest, request: Request
     job = get_job(request.app.state.db_path, job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    if job["status"] not in {"READY_FOR_REVIEW", "EXPORTED"}:
+    if job["status"] not in REVIEWABLE_JOB_STATUSES:
         raise HTTPException(409, "job status does not allow missed object annotation")
 
     transformer = transformer_4326_to_25832()
@@ -266,7 +263,7 @@ def remove_missed_object(job_id: str, missed_id: int, request: Request):
     job = get_job(request.app.state.db_path, job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    if job["status"] not in {"READY_FOR_REVIEW", "EXPORTED"}:
+    if job["status"] not in REVIEWABLE_JOB_STATUSES:
         raise HTTPException(409, "job status does not allow missed object annotation")
     deleted = delete_missed_object(request.app.state.db_path, job_id, missed_id)
     if not deleted:
@@ -297,7 +294,7 @@ def validate_bulk_endpoint(job_id: str, req: ValidateBulkRequest, request: Reque
     job = get_job(request.app.state.db_path, job_id)
     if job is None:
         raise HTTPException(404, "job not found")
-    if job["status"] not in {"READY_FOR_REVIEW", "EXPORTED"}:
+    if job["status"] not in REVIEWABLE_JOB_STATUSES:
         raise HTTPException(409, "job status does not allow validation")
     updated = validate_bulk(
         request.app.state.db_path,
@@ -340,7 +337,7 @@ def export_job(job_id: str, request: Request):
         job = get_job(request.app.state.db_path, job_id)
         if job is None:
             raise HTTPException(404, "job not found")
-        if job["status"] not in {"READY_FOR_REVIEW", "EXPORTED"}:
+        if job["status"] not in REVIEWABLE_JOB_STATUSES:
             raise HTTPException(409, "job not ready for export")
         out_path = request.app.state.results_dir / f"{job_id}.gpkg"
         try:

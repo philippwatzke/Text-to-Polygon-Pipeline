@@ -17,6 +17,13 @@ class JobStatus(StrEnum):
     EXPORTED = "EXPORTED"
     FAILED = "FAILED"
 
+
+RUNNING_JOB_STATUSES = frozenset({JobStatus.DOWNLOADING, JobStatus.INFERRING})
+ACTIVE_JOB_STATUSES = frozenset(
+    {JobStatus.PENDING, JobStatus.DOWNLOADING, JobStatus.INFERRING}
+)
+REVIEWABLE_JOB_STATUSES = frozenset({JobStatus.READY_FOR_REVIEW, JobStatus.EXPORTED})
+
 class ErrorReason(StrEnum):
     DOP_TIMEOUT = "DOP_TIMEOUT"
     DOP_HTTP_ERROR = "DOP_HTTP_ERROR"

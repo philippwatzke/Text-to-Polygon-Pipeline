@@ -1,6 +1,9 @@
 import numpy as np
+import geopandas as gpd
 from affine import Affine
 from pathlib import Path
+from shapely.geometry import Polygon
+from shapely.wkb import loads as wkb_loads
 
 from ki_geodaten.jobs.store import (
     get_job,
@@ -38,7 +41,7 @@ class FakeSrc:
         return None
 
 
-def _setup_job(tmp_path: Path) -> Path:
+def _setup_job(tmp_path: Path, *, vector_options=None) -> Path:
     db = tmp_path / "j.db"
     init_schema(db)
     insert_job(
@@ -48,6 +51,7 @@ def _setup_job(tmp_path: Path) -> Path:
         bbox_wgs84=[11.0, 48.0, 11.01, 48.01],
         bbox_utm_snapped=[691000.0, 5335000.0, 692000.0, 5336000.0],
         tile_preset=TilePreset.MEDIUM,
+        vector_options=vector_options,
     )
     return db
 
@@ -268,6 +272,76 @@ def test_orchestrator_happy_path_marks_ready(tmp_path, monkeypatch):
     assert job["tile_total"] == 1
     assert job["tile_completed"] == 1
     assert len(get_polygons_for_job(db, "j1")) == 1
+
+
+def test_orchestrator_applies_vector_simplification_before_persist(tmp_path, monkeypatch):
+    db = _setup_job(
+        tmp_path,
+        vector_options={"simplification_tolerance_m": 0.1, "orthogonalize": False},
+    )
+    noisy = Polygon(
+        [
+            (0, 0),
+            (1, 0.02),
+            (2, 0),
+            (3, 0.01),
+            (4, 0),
+            (4, 2),
+            (0, 2),
+            (0, 0),
+        ]
+    )
+    gdf = gpd.GeoDataFrame(
+        [{
+            "score": 0.9,
+            "source_tile_row": 0,
+            "source_tile_col": 0,
+            "ndvi_mean": None,
+            "ndsm_mean": None,
+        }],
+        geometry=[noisy],
+        crs="EPSG:25832",
+    )
+    mask = np.zeros((1024, 1024), dtype=bool)
+    mask[500:524, 500:524] = True
+    result = MaskResult(mask=mask, score=0.9, box_pixel=(500, 500, 524, 524))
+    _patch_io(monkeypatch, [_tile()])
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.masks_to_polygons", lambda *args, **kwargs: gdf)
+
+    _run(db, tmp_path, StubSegmenter([[result]]))
+
+    geom = wkb_loads(get_polygons_for_job(db, "j1")[0]["geometry_wkb"])
+    assert len(geom.exterior.coords) < len(noisy.exterior.coords)
+
+
+def test_orchestrator_applies_vector_orthogonalization_before_persist(tmp_path, monkeypatch):
+    db = _setup_job(
+        tmp_path,
+        vector_options={"simplification_tolerance_m": None, "orthogonalize": True},
+    )
+    near_rect = Polygon([(0, 0), (4, 0), (4, 2), (2, 2), (2, 1.9), (0, 2), (0, 0)])
+    gdf = gpd.GeoDataFrame(
+        [{
+            "score": 0.9,
+            "source_tile_row": 0,
+            "source_tile_col": 0,
+            "ndvi_mean": None,
+            "ndsm_mean": None,
+        }],
+        geometry=[near_rect],
+        crs="EPSG:25832",
+    )
+    mask = np.zeros((1024, 1024), dtype=bool)
+    mask[500:524, 500:524] = True
+    result = MaskResult(mask=mask, score=0.9, box_pixel=(500, 500, 524, 524))
+    _patch_io(monkeypatch, [_tile()])
+    monkeypatch.setattr("ki_geodaten.worker.orchestrator.masks_to_polygons", lambda *args, **kwargs: gdf)
+
+    _run(db, tmp_path, StubSegmenter([[result]]))
+
+    geom = wkb_loads(get_polygons_for_job(db, "j1")[0]["geometry_wkb"])
+    assert geom.area == 8
+    assert len(geom.exterior.coords) == 5
 
 
 def test_orchestrator_applies_global_polygon_nms_across_tiles(tmp_path, monkeypatch):
